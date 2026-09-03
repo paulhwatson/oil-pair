@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oil-pair"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "trading-ig==0.0.22",
+    "lightstreamer-client-lib",
+    "pandas",
+    "scikit-learn",
+    "python-dotenv",
+    "tomli-w",
+]
+
+[tool.setuptools.packages.find]
+include = ["oil_pair*"]
