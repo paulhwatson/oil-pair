@@ -30,6 +30,7 @@ from oil_pair.strategy_logic import (
 log = logging.getLogger(__name__)
 
 MAX_CONSECUTIVE_ERRORS = 10
+SPREAD_LOG_INTERVAL_SECONDS = 60
 
 _shutdown_requested = False
 
@@ -271,6 +272,7 @@ def _run_locked() -> None:
     model: Model | None = None
     refit_buffer: list[tuple[pd.Timestamp, float, float]] = []
     next_refit_at: pd.Timestamp | None = None
+    next_spread_log_at: pd.Timestamp | None = None
 
     consecutive_errors = 0
     log.info(
@@ -302,6 +304,16 @@ def _run_locked() -> None:
                     else:
                         assert next_refit_at is not None  # set alongside model, always together
                         spread = compute_spread(mids[model.i1_key], mids[model.i2_key], model.hedge_ratio)
+
+                        if next_spread_log_at is None or now >= next_spread_log_at:
+                            log.info(
+                                "spread=%.6f (%.2f std) entry=+-%.6f limit=+-%.6f stop=+-%.6f std_spread=%.6f side=%s",
+                                spread, spread / model.std_spread if model.std_spread else float("nan"),
+                                model.entry_threshold, model.limit_threshold, model.stop_threshold,
+                                model.std_spread, state.side,
+                            )
+                            next_spread_log_at = now + pd.Timedelta(seconds=SPREAD_LOG_INTERVAL_SECONDS)
+
                         decision = next_decision(spread, model, state.side, state.stopped_out)
                         if decision.action is not Action.NONE:
                             log.info("decision: %s reason=%r spread=%.6f", decision.action, decision.reason, spread)
