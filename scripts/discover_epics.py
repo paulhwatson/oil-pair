@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""One-time interactive setup: find and confirm the real IG epics for the
-Brent Crude / gasoline pair, and write them to config/pair_config.toml.
+"""One-time interactive setup: find and confirm the real IG epics for a
+pair, and write them to config/<pair_name>/pair_config.toml.
 
-Re-run this whenever the chosen futures contract rolls to a new expiry.
+Usage:
+    discover_epics.py <pair_name> <search terms for instrument A> -- <search terms for instrument B>
+
+Example:
+    discover_epics.py brent_gasoline "Brent Crude" -- "Unleaded" "Gasoline" "RBOB" "Gas Oil"
+
+Re-run this whenever the chosen futures contract rolls to a new expiry
+(delete config/<pair_name>/pair_config.toml first).
 """
 
 from __future__ import annotations
@@ -16,16 +23,15 @@ import tomli_w
 
 from oil_pair.discovery import format_candidates_table, search_multiple_terms
 from oil_pair.ig_client import IGClient
-from oil_pair.settings import DEFAULT_PAIR_CONFIG_PATH, StrategyConfig, load_credentials
-
-GASOLINE_SEARCH_TERMS = ["Unleaded", "Gasoline", "RBOB", "Gas Oil"]
+from oil_pair.paths import resolve as resolve_paths
+from oil_pair.settings import StrategyConfig, load_credentials
 
 
 def prompt_for_row(df, label: str) -> dict:
     print(f"\n=== {label} candidates ===")
     print(format_candidates_table(df))
     if len(df) == 0:
-        raise SystemExit(f"No candidates found for {label}. Try adjusting the search terms in this script.")
+        raise SystemExit(f"No candidates found for {label}. Try adjusting the search terms.")
     while True:
         choice = input(f"\nPick the row number for {label} (or 'q' to quit): ").strip()
         if choice.lower() == "q":
@@ -50,36 +56,50 @@ def confirm_instrument(client: IGClient, epic: str, name: str, expiry: str) -> s
 
 
 def main() -> None:
+    if "--" not in sys.argv:
+        raise SystemExit(
+            "usage: discover_epics.py <pair_name> <search terms for A...> -- <search terms for B...>\n"
+            'example: discover_epics.py brent_gasoline "Brent Crude" -- "Unleaded" "Gasoline" "RBOB"'
+        )
+    pair_name = sys.argv[1]
+    split = sys.argv.index("--")
+    terms_a = sys.argv[2:split]
+    terms_b = sys.argv[split + 1:]
+    if not terms_a or not terms_b:
+        raise SystemExit("need at least one search term on each side of --")
+
+    paths = resolve_paths(pair_name)
+
     creds = load_credentials()
     client = IGClient(creds)
     client.login()
 
-    brent_candidates = client.search_markets("Brent Crude")
-    brent_row = prompt_for_row(brent_candidates, "Brent Crude")
+    candidates_a = search_multiple_terms(client.search_markets, terms_a)
+    row_a = prompt_for_row(candidates_a, "instrument A")
 
-    gasoline_candidates = search_multiple_terms(client.search_markets, GASOLINE_SEARCH_TERMS)
-    gasoline_row = prompt_for_row(gasoline_candidates, "Gasoline")
+    candidates_b = search_multiple_terms(client.search_markets, terms_b)
+    row_b = prompt_for_row(candidates_b, "instrument B")
 
-    currency_a = confirm_instrument(client, brent_row["epic"], brent_row["instrumentName"], brent_row["expiry"])
-    currency_b = confirm_instrument(client, gasoline_row["epic"], gasoline_row["instrumentName"], gasoline_row["expiry"])
+    currency_a = confirm_instrument(client, row_a["epic"], row_a["instrumentName"], row_a["expiry"])
+    currency_b = confirm_instrument(client, row_b["epic"], row_b["instrumentName"], row_b["expiry"])
 
-    if DEFAULT_PAIR_CONFIG_PATH.exists():
-        print(f"\n{DEFAULT_PAIR_CONFIG_PATH} already exists - not overwriting (to avoid clobbering tuned "
+    if paths.pair_config.exists():
+        print(f"\n{paths.pair_config} already exists - not overwriting (to avoid clobbering tuned "
               f"thresholds). Delete it first if you want to regenerate from scratch.")
         raise SystemExit(1)
 
     strategy_defaults = StrategyConfig()
     config = {
         "instrument_a": {
-            "epic": brent_row["epic"],
-            "name": brent_row["instrumentName"],
-            "expiry": brent_row["expiry"],
+            "epic": row_a["epic"],
+            "name": row_a["instrumentName"],
+            "expiry": row_a["expiry"],
             "currency_code": currency_a,
         },
         "instrument_b": {
-            "epic": gasoline_row["epic"],
-            "name": gasoline_row["instrumentName"],
-            "expiry": gasoline_row["expiry"],
+            "epic": row_b["epic"],
+            "name": row_b["instrumentName"],
+            "expiry": row_b["expiry"],
             "currency_code": currency_b,
         },
         "strategy": {
@@ -93,15 +113,15 @@ def main() -> None:
         },
     }
 
-    DEFAULT_PAIR_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with DEFAULT_PAIR_CONFIG_PATH.open("wb") as f:
+    paths.pair_config.parent.mkdir(parents=True, exist_ok=True)
+    with paths.pair_config.open("wb") as f:
         tomli_w.dump(config, f)
 
-    print(f"\nWrote {DEFAULT_PAIR_CONFIG_PATH}")
+    print(f"\nWrote {paths.pair_config}")
     print(f"  instrument_a: {config['instrument_a']}")
     print(f"  instrument_b: {config['instrument_b']}")
-    print("\nReview the [strategy] thresholds in that file before running oil_pair/main.py - "
-          "these are generic defaults, not validated for this specific pair.")
+    print(f"\nReview the [strategy] thresholds in that file before running "
+          f"`python -m oil_pair.main {pair_name}` - these are generic defaults, not validated for this pair.")
 
 
 if __name__ == "__main__":

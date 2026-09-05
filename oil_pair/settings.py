@@ -1,4 +1,5 @@
-"""Credentials (.env) and pair/strategy config (config/pair_config.toml) loading."""
+"""Credentials (.env) and pair/strategy config (config/<pair_name>/pair_config.toml,
+see oil_pair/paths.py) loading."""
 
 from __future__ import annotations
 

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import signal
+import sys
 import time
 from dataclasses import replace
+from pathlib import Path
 
 import pandas as pd
 from trading_ig.rest import ApiExceededException, IGException, TokenInvalidException
@@ -13,6 +15,7 @@ from trading_ig.rest import ApiExceededException, IGException, TokenInvalidExcep
 from oil_pair import instance_lock, price_log
 from oil_pair.ig_client import IGClient
 from oil_pair.logging_setup import configure_logging
+from oil_pair.paths import PairPaths, resolve as resolve_paths
 from oil_pair.price_streamer import PriceStreamer
 from oil_pair.settings import InstrumentConfig, PairConfig, StrategyConfig, load_credentials, load_pair_config
 from oil_pair.state_store import LegPosition, RunState, StateCorruptedError, load_state, save_state
@@ -41,14 +44,14 @@ def _handle_shutdown_signal(signum, frame):
     _shutdown_requested = True
 
 
-def reconcile_positions(client: IGClient, pair_config: PairConfig) -> RunState:
+def reconcile_positions(client: IGClient, pair_config: PairConfig, state_path: Path) -> RunState:
     """Resumes state from the local state file, keyed by deal_id - NOT by
     scanning IG for "any position on epic_a/epic_b", since other strategies
     or manual trades may hold positions on the same instruments. A missing
     state file means "we have no record of owning anything", not "adopt
     whatever's open".
     """
-    saved = load_state()
+    saved = load_state(state_path)
     if saved is None:
         log.info("no saved state found - starting FLAT (existing positions on these epics, if any, are not "
                   "assumed to belong to this app)")
@@ -212,40 +215,41 @@ def apply_decision(
     return RunState(side=PairSide.FLAT, stopped_out=decision.stopped_out)
 
 
-def run() -> None:
-    configure_logging()
+def run(pair_name: str) -> None:
+    paths = resolve_paths(pair_name)
+    configure_logging(log_dir=paths.log_dir)
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
 
     try:
-        instance_lock.acquire()
+        instance_lock.acquire(paths.instance_lock)
     except instance_lock.AlreadyRunningError as exc:
         log.critical(
-            "%s Running two instances against the same account corrupts shared state "
-            "(state/run_state.json) and can race placing/closing orders.",
-            exc,
+            "%s Running two instances of the same pair against the same account corrupts shared state "
+            "(%s) and can race placing/closing orders.",
+            exc, paths.state,
         )
         raise SystemExit(1) from exc
 
     try:
-        _run_locked()
+        _run_locked(paths)
     finally:
-        instance_lock.release()
+        instance_lock.release(paths.instance_lock)
 
 
-def _run_locked() -> None:
+def _run_locked(paths: PairPaths) -> None:
     creds = load_credentials()
-    pair_config = load_pair_config()
+    pair_config = load_pair_config(paths.pair_config)
 
     client = IGClient(creds)
     client.login()
 
     try:
-        state = reconcile_positions(client, pair_config)
+        state = reconcile_positions(client, pair_config, paths.state)
     except StateCorruptedError as exc:
         log.critical("%s", exc)
         raise SystemExit(1) from exc
-    save_state(state)
+    save_state(state, paths.state)
 
     epic_a, epic_b = pair_config.instrument_a.epic, pair_config.instrument_b.epic
     rules = {
@@ -261,8 +265,8 @@ def _run_locked() -> None:
     # runs) plus freshly streamed prices - no historical-data REST call, so
     # this never hits IG's weekly, non-retryable allowance. model stays None
     # until enough data has accumulated; see try_build_initial_model.
-    cached_a = price_log.load_mid_series(epic_a)
-    cached_b = price_log.load_mid_series(epic_b)
+    cached_a = price_log.load_mid_series(epic_a, paths.price_log)
+    cached_b = price_log.load_mid_series(epic_b, paths.price_log)
     if cached_a.empty and cached_b.empty:
         log.info(
             "no local price cache yet - warming up for %d min before the first fit",
@@ -289,8 +293,8 @@ def _run_locked() -> None:
                     now = pd.Timestamp.now(tz="UTC")
                     mids = {epic_a: snapshot[epic_a].mid, epic_b: snapshot[epic_b].mid}
                     refit_buffer.append((now, mids[epic_a], mids[epic_b]))
-                    price_log.append_tick(epic_a, mids[epic_a], now)
-                    price_log.append_tick(epic_b, mids[epic_b], now)
+                    price_log.append_tick(epic_a, mids[epic_a], now, paths.price_log)
+                    price_log.append_tick(epic_b, mids[epic_b], now, paths.price_log)
 
                     if model is None:
                         model = try_build_initial_model(
@@ -318,7 +322,7 @@ def _run_locked() -> None:
                         if decision.action is not Action.NONE:
                             log.info("decision: %s reason=%r spread=%.6f", decision.action, decision.reason, spread)
                         state = apply_decision(client, decision, state, pair_config, model, rules, mids)
-                        save_state(state)
+                        save_state(state, paths.state)
 
                         if now >= next_refit_at and len(refit_buffer) >= 2:
                             model = refit_model(refit_buffer, pair_config, epic_a, epic_b)
@@ -353,4 +357,7 @@ def _run_locked() -> None:
 
 
 if __name__ == "__main__":
-    run()
+    if len(sys.argv) != 2:
+        print(f"usage: {sys.argv[0]} <pair_name>  (e.g. brent_gasoline - matches a directory under config/)")
+        raise SystemExit(1)
+    run(sys.argv[1])

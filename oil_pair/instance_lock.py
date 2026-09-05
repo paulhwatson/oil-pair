@@ -1,11 +1,12 @@
-"""Single-instance guard.
+"""Single-instance guard, scoped per pair (see oil_pair/paths.py).
 
-Two concurrent instances of this app trading the same account is a real
-failure mode, not a hypothetical one: they'd independently read/write the
-same state/run_state.json with no coordination, corrupting it (this is
-exactly what caused a real incident - see state_store.py) and could race
+Two concurrent instances of the SAME pair is a real failure mode, not a
+hypothetical one: they'd independently read/write the same
+state/<pair_name>/run_state.json with no coordination, corrupting it (this
+is exactly what caused a real incident - see state_store.py) and could race
 each other placing/closing orders. This lock makes a second concurrent
-start fail loudly instead of silently doing that.
+start of the same pair fail loudly instead of silently doing that. Two
+different pairs use different lock files and don't interact.
 """
 
 from __future__ import annotations

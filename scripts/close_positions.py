@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Closes exactly the position(s) this app's local state currently tracks
-(state/run_state.json), then resets local state to FLAT.
+"""Closes exactly the position(s) this pair's local state currently tracks
+(state/<pair_name>/run_state.json), then resets local state to FLAT.
 
 Deliberately does NOT touch any other open position that might exist on
 these epics - see reconcile_positions() in oil_pair/main.py for why: this
-account may run other strategies or hold manually-opened positions on the
-same instruments, and this app must never assume ownership of a position it
-doesn't recognize by deal_id.
+account may run other strategies (including other pairs run by this same
+app) or hold manually-opened positions on the same instruments, and this
+app must never assume ownership of a position it doesn't recognize by
+deal_id.
 
-Refuses to run while a live `python -m oil_pair.main` instance holds the
-instance lock, since both would read/write the same state file concurrently
-(the exact race that corrupted it once already - see instance_lock.py).
+Refuses to run while a live `python -m oil_pair.main <pair_name>` instance
+of the SAME pair holds the instance lock, since both would read/write the
+same state file concurrently (the exact race that corrupted it once
+already - see instance_lock.py). Other pairs' instances are unaffected.
+
+Usage: close_positions.py <pair_name>
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from oil_pair import instance_lock
 from oil_pair.ig_client import IGClient
 from oil_pair.logging_setup import configure_logging
+from oil_pair.paths import PairPaths, resolve as resolve_paths
 from oil_pair.settings import load_credentials, load_pair_config
 from oil_pair.state_store import RunState, StateCorruptedError, load_state, save_state
 from oil_pair.strategy_logic import PairSide
@@ -31,18 +36,18 @@ from oil_pair.strategy_logic import PairSide
 log = logging.getLogger(__name__)
 
 
-def _close_tracked_positions() -> None:
+def _close_tracked_positions(paths: PairPaths) -> None:
     try:
-        state = load_state()
+        state = load_state(paths.state)
     except StateCorruptedError as exc:
         print(f"Cannot proceed: {exc}")
         raise SystemExit(1) from exc
 
     if state is None or state.side is PairSide.FLAT:
-        print("No tracked open position - nothing to close.")
+        print(f"No tracked open position for {paths.pair_name} - nothing to close.")
         return
 
-    pair_config = load_pair_config()
+    pair_config = load_pair_config(paths.pair_config)
     client = IGClient(load_credentials())
     client.login()
 
@@ -66,23 +71,27 @@ def _close_tracked_positions() -> None:
         client.close_market_position(deal_id=leg.deal_id, direction=opposite, size=size, epic=epic)
         closed_any = True
 
-    save_state(RunState(side=PairSide.FLAT, stopped_out=False))
+    save_state(RunState(side=PairSide.FLAT, stopped_out=False), paths.state)
     print("Done - local state reset to FLAT." if closed_any else "Nothing needed closing - local state reset to FLAT.")
 
 
 def main() -> None:
-    configure_logging()
+    if len(sys.argv) != 2:
+        raise SystemExit(f"usage: {sys.argv[0]} <pair_name>")
+    paths = resolve_paths(sys.argv[1])
+
+    configure_logging(log_dir=paths.log_dir)
 
     try:
-        instance_lock.acquire()
+        instance_lock.acquire(paths.instance_lock)
     except instance_lock.AlreadyRunningError as exc:
-        print(f"Refusing to run: {exc} Stop the live app first.")
+        print(f"Refusing to run: {exc} Stop the live app for {paths.pair_name} first.")
         raise SystemExit(1) from exc
 
     try:
-        _close_tracked_positions()
+        _close_tracked_positions(paths)
     finally:
-        instance_lock.release()
+        instance_lock.release(paths.instance_lock)
 
 
 if __name__ == "__main__":
