@@ -286,10 +286,20 @@ def _run_locked(paths: PairPaths) -> None:
     try:
         while not _shutdown_requested:
             try:
-                snapshot = streamer.latest_snapshot()
-                if snapshot[epic_a].market_status != "TRADEABLE" or snapshot[epic_b].market_status != "TRADEABLE":
-                    log.debug("market not tradeable, skipping iteration")
+                # Check tradeability from whatever's cached (possibly stale -
+                # e.g. over a weekend, nothing has arrived in a while because
+                # nothing is trading, not because the stream is broken)
+                # before demanding a fresh snapshot. Calling latest_snapshot()
+                # unconditionally here used to raise on every iteration once
+                # markets closed, tripping MAX_CONSECUTIVE_ERRORS and exiting
+                # a couple of minutes into every weekend.
+                peek = streamer.peek_snapshot()
+                status_a = peek[epic_a].market_status if epic_a in peek else None
+                status_b = peek[epic_b].market_status if epic_b in peek else None
+                if status_a != "TRADEABLE" or status_b != "TRADEABLE":
+                    log.debug("market not tradeable (a=%s b=%s), skipping iteration", status_a, status_b)
                 else:
+                    snapshot = streamer.latest_snapshot()
                     now = pd.Timestamp.now(tz="UTC")
                     mids = {epic_a: snapshot[epic_a].mid, epic_b: snapshot[epic_b].mid}
                     refit_buffer.append((now, mids[epic_a], mids[epic_b]))

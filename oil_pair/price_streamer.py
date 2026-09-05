@@ -79,6 +79,19 @@ class PriceStreamer:
         missing = [epic for epic in self._epics if epic not in self._latest]
         raise TimeoutError(f"no price stream update received within {timeout}s for: {missing}")
 
+    def peek_snapshot(self) -> dict[str, Snapshot]:
+        """Returns whatever's cached right now - possibly stale, possibly
+        missing an epic that's never sent anything - without raising. IG
+        pushes a MARKET_STATE update when a market closes (e.g. for the
+        weekend), so the cached status is still meaningful even once prices
+        stop moving; use this to check tradeability before deciding whether
+        to demand a fresh snapshot via latest_snapshot(). Staleness here is
+        expected and NOT an error - there is nothing to trade against a
+        closed market, not a broken stream.
+        """
+        with self._lock:
+            return dict(self._latest)
+
     def latest_snapshot(self) -> dict[str, Snapshot]:
         """Raises RuntimeError if any epic has no price yet, or its last
         update is older than max_staleness_seconds - callers must not

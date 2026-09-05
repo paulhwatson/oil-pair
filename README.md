@@ -129,9 +129,16 @@ dependency required to run the test suite.
   not REST polling. A background thread keeps an in-memory cache of the
   latest bid/offer/market-status per epic; the main loop reads from that
   cache every `poll_interval_seconds` (default 10s) rather than making a
-  REST call each iteration. If no update has been received for an epic in
-  over `max_staleness_seconds` (default 60s), `latest_snapshot()` raises
-  rather than silently trading on stale data.
+  REST call each iteration. Two ways to read it: `peek_snapshot()` returns
+  whatever's cached, however stale, and never raises - used only to check
+  `market_status` (IG pushes a status update when a market closes, e.g. for
+  the weekend, even though prices stop moving); `latest_snapshot()` raises
+  if any epic's last update is older than `max_staleness_seconds` (default
+  60s) - used only once the market is already confirmed tradeable, so a
+  real stream problem during trading hours still fails loudly instead of
+  silently trading on frozen data. Checking tradeability via
+  `latest_snapshot()` directly used to make every weekend close look like a
+  stream failure and trip `MAX_CONSECUTIVE_ERRORS` within minutes.
 - **No historical-data REST call at all.** The initial hedge-ratio fit is
   seeded from `price_log/<pair_name>/ticks.csv` (built by this app's own
   past runs) plus freshly streamed prices - see `try_build_initial_model` in
