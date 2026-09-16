@@ -205,14 +205,35 @@ def apply_decision(
 
     # EXIT_TAKE_PROFIT or EXIT_STOP_LOSS
     log.info("%s: closing both legs", decision.action)
-    for leg, instrument in ((state.leg_a, pair_config.instrument_a), (state.leg_b, pair_config.instrument_b)):
+
+    def _close_leg(leg: LegPosition | None, instrument: InstrumentConfig) -> LegPosition | None:
+        """Returns None once the leg is confirmed closed (or if it was
+        already None), or the same leg unchanged if closing it failed - so
+        the caller keeps retrying just that leg on future iterations rather
+        than losing track of it. One leg failing must never prevent
+        attempting the other (this used to be one un-isolated loop, so an
+        IG-side error closing the first leg left the second leg never even
+        attempted, with local state stuck reporting both as still open)."""
         if leg is None:
-            continue
+            return None
         opposite = "SELL" if leg.direction == "BUY" else "BUY"
         size = compute_leg_size(pair_config.strategy.notional_trade_size, mids[instrument.epic], rules[instrument.epic])
-        client.close_market_position(deal_id=leg.deal_id, direction=opposite, size=size, epic=instrument.epic)
+        try:
+            client.close_market_position(deal_id=leg.deal_id, direction=opposite, size=size, epic=instrument.epic)
+            return None
+        except Exception:
+            log.critical(
+                "failed to close %s leg (deal_id=%s) - still exposed, will keep retrying on future iterations",
+                instrument.epic, leg.deal_id,
+            )
+            return leg
 
-    return RunState(side=PairSide.FLAT, stopped_out=decision.stopped_out)
+    remaining_leg_a = _close_leg(state.leg_a, pair_config.instrument_a)
+    remaining_leg_b = _close_leg(state.leg_b, pair_config.instrument_b)
+
+    if remaining_leg_a is None and remaining_leg_b is None:
+        return RunState(side=PairSide.FLAT, stopped_out=decision.stopped_out)
+    return replace(state, leg_a=remaining_leg_a, leg_b=remaining_leg_b, stopped_out=decision.stopped_out)
 
 
 def run(pair_name: str) -> None:
