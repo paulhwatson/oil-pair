@@ -288,10 +288,25 @@ def _run_locked(paths: PairPaths) -> None:
     # until enough data has accumulated; see try_build_initial_model.
     cached_a = price_log.load_mid_series(epic_a, paths.price_log)
     cached_b = price_log.load_mid_series(epic_b, paths.price_log)
-    if cached_a.empty and cached_b.empty:
+    warmup_minutes = pair_config.strategy.warmup_minutes
+    cache_starts = [s.index.min() for s in (cached_a, cached_b) if not s.empty]
+    # Until this fit lands, the only per-iteration log line is the debug-level
+    # "market not tradeable" skip - nothing at INFO - so a quiet log here looks
+    # identical to a hung process. Log when to expect it, so "why has nothing
+    # logged in N minutes" is answerable from the log alone.
+    if cache_starts:
+        expected_fit_at = min(cache_starts) + pd.Timedelta(minutes=warmup_minutes)
         log.info(
-            "no local price cache yet - warming up for %d min before the first fit",
-            pair_config.strategy.warmup_minutes,
+            "loaded local price cache (earliest=%s) - expecting first fit around %s, "
+            "no periodic logging before then",
+            min(cache_starts).isoformat(), expected_fit_at.isoformat(),
+        )
+    else:
+        expected_fit_at = pd.Timestamp.now(tz="UTC") + pd.Timedelta(minutes=warmup_minutes)
+        log.info(
+            "no local price cache yet - warming up for %d min before the first fit "
+            "(expected around %s), no periodic logging before then",
+            warmup_minutes, expected_fit_at.isoformat(),
         )
 
     model: Model | None = None
