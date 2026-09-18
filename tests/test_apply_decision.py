@@ -13,6 +13,10 @@ from oil_pair.state_store import LegPosition, RunState
 from oil_pair.strategy_logic import Action, Decision, Model, PairSide
 
 
+def _positions_df(deal_ids: list[str]) -> pd.DataFrame:
+    return pd.DataFrame({"dealId": deal_ids})
+
+
 @pytest.fixture
 def pair_config():
     return PairConfig(
@@ -43,8 +47,13 @@ def mids():
 
 
 class FakeClient:
-    def __init__(self, fail_epics: set[str] = frozenset()):
+    def __init__(self, fail_epics: set[str] = frozenset(), open_deal_ids: set[str] | None = None):
         self._fail_epics = fail_epics
+        # None means "can't confirm either way" (fetch_open_positions raises),
+        # matching the old behavior of always retaining a leg whose close
+        # failed. Tests that care about the reconciliation-against-IG path
+        # pass an explicit set instead.
+        self._open_deal_ids = open_deal_ids
         self.open_calls = []
         self.close_calls = []
 
@@ -58,6 +67,11 @@ class FakeClient:
         self.close_calls.append(epic)
         if epic in self._fail_epics:
             raise RuntimeError(f"simulated IG error closing {epic}")
+
+    def fetch_open_positions(self):
+        if self._open_deal_ids is None:
+            raise RuntimeError("simulated failure fetching open positions")
+        return _positions_df(list(self._open_deal_ids))
 
 
 def short_state():
@@ -122,6 +136,29 @@ def test_exit_retains_both_legs_when_both_closes_fail(pair_config, model, rules,
     assert result.leg_a == state.leg_a
     assert result.leg_b == state.leg_b
     assert result.stopped_out is True
+
+
+def test_exit_clears_leg_when_close_fails_but_ig_shows_it_already_gone(pair_config, model, rules, mids):
+    # Real incident: closing an already-closed DFB position returns an
+    # unrelated-looking IG error rather than a clean "not found", so the
+    # close call raises even though there's nothing left to close. Confirm
+    # via fetch_open_positions instead of retrying forever.
+    client = FakeClient(fail_epics={"EPIC.A"}, open_deal_ids=set())
+    decision = Decision(action=Action.EXIT_STOP_LOSS, side=PairSide.FLAT, stopped_out=True, reason="test")
+
+    result = apply_decision(client, decision, short_state(), pair_config, model, rules, mids)
+
+    assert result == RunState(side=PairSide.FLAT, stopped_out=True)
+
+
+def test_exit_retains_leg_when_close_fails_and_ig_confirms_still_open(pair_config, model, rules, mids):
+    client = FakeClient(fail_epics={"EPIC.A"}, open_deal_ids={"DEAL-A", "DEAL-B"})
+    decision = Decision(action=Action.EXIT_STOP_LOSS, side=PairSide.FLAT, stopped_out=True, reason="test")
+
+    result = apply_decision(client, decision, short_state(), pair_config, model, rules, mids)
+
+    assert result.leg_a == LegPosition(deal_id="DEAL-A", direction="SELL")
+    assert result.leg_b is None
 
 
 def test_enter_closes_first_leg_and_reraises_when_second_leg_fails_to_open(pair_config, model, rules, mids):

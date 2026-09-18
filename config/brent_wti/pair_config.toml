@@ -15,6 +15,6 @@ notional_trade_size = 1000
 model_update_interval_business_days = 7
 entry_stds = 1.5
 limit_stds = 1.0
-stop_stds = 3.0
+stop_stds = 6.0
 poll_interval_seconds = 15
 warmup_minutes = 30

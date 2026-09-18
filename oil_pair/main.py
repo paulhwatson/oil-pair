@@ -221,10 +221,31 @@ def apply_decision(
         try:
             client.close_market_position(deal_id=leg.deal_id, direction=opposite, size=size, epic=instrument.epic)
             return None
-        except Exception:
+        except Exception as exc:
+            # IG can fail to close a deal_id that's already gone from the
+            # account (observed: closing an already-closed DFB position
+            # returns an unrelated-looking "notional.details.null" error,
+            # not a clean "not found") - retrying that forever spams
+            # CRITICAL logs over a leg that was never actually exposed.
+            # Cross-check against IG's own open positions before assuming
+            # the worst.
+            try:
+                open_positions = client.fetch_open_positions()
+                still_open = len(open_positions) > 0 and leg.deal_id in set(open_positions["dealId"])
+            except Exception:
+                still_open = True  # can't confirm either way - assume the worst and keep retrying
+
+            if not still_open:
+                log.warning(
+                    "close failed for %s leg (deal_id=%s): %s - but IG shows no such open position, "
+                    "treating it as already closed",
+                    instrument.epic, leg.deal_id, exc,
+                )
+                return None
+
             log.critical(
-                "failed to close %s leg (deal_id=%s) - still exposed, will keep retrying on future iterations",
-                instrument.epic, leg.deal_id,
+                "failed to close %s leg (deal_id=%s): %s - still exposed, will keep retrying on future iterations",
+                instrument.epic, leg.deal_id, exc,
             )
             return leg
 
