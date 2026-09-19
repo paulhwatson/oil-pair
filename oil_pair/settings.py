@@ -13,13 +13,6 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PAIR_CONFIG_PATH = REPO_ROOT / "config" / "pair_config.toml"
 
-_REQUIRED_ENV_VARS = (
-    "IG_DEMO_USERNAME",
-    "IG_DEMO_PASSWORD",
-    "IG_DEMO_API_KEY",
-    "IG_DEMO_ACC_NUMBER",
-)
-
 
 @dataclass(frozen=True)
 class IGCredentials:
@@ -30,21 +23,31 @@ class IGCredentials:
     acc_type: str = "demo"
 
 
-def load_credentials() -> IGCredentials:
+def load_credentials(live: bool = False) -> IGCredentials:
+    """Reads IG_LIVE_* env vars when live=True, IG_DEMO_* otherwise. The two
+    namespaces are kept completely separate (never a shared/generic IG_*
+    var) so a credential meant for one account can never accidentally
+    authenticate against the other - demo is what runs unless a caller
+    explicitly asks for live.
+    """
     load_dotenv(REPO_ROOT / ".env")
 
-    missing = [name for name in _REQUIRED_ENV_VARS if not os.environ.get(name)]
+    prefix = "IG_LIVE" if live else "IG_DEMO"
+    required = [f"{prefix}_USERNAME", f"{prefix}_PASSWORD", f"{prefix}_API_KEY", f"{prefix}_ACC_NUMBER"]
+
+    missing = [name for name in required if not os.environ.get(name)]
     if missing:
         raise RuntimeError(
             f"Missing required .env variables: {', '.join(missing)}. "
-            f"Copy .env.example to .env and fill in your IG demo credentials."
+            f"Copy .env.example to .env and fill in your IG {'live' if live else 'demo'} credentials."
         )
 
     return IGCredentials(
-        username=os.environ["IG_DEMO_USERNAME"],
-        password=os.environ["IG_DEMO_PASSWORD"],
-        api_key=os.environ["IG_DEMO_API_KEY"],
-        acc_number=os.environ["IG_DEMO_ACC_NUMBER"],
+        username=os.environ[f"{prefix}_USERNAME"],
+        password=os.environ[f"{prefix}_PASSWORD"],
+        api_key=os.environ[f"{prefix}_API_KEY"],
+        acc_number=os.environ[f"{prefix}_ACC_NUMBER"],
+        acc_type="live" if live else "demo",
     )
 
 
@@ -96,3 +99,30 @@ def load_pair_config(path: Path = DEFAULT_PAIR_CONFIG_PATH) -> PairConfig:
         raise RuntimeError(f"{path} is malformed: {exc}") from exc
 
     return PairConfig(instrument_a=instrument_a, instrument_b=instrument_b, strategy=strategy)
+
+
+@dataclass(frozen=True)
+class EmailConfig:
+    smtp_username: str
+    smtp_app_password: str
+    to_address: str
+
+
+def load_email_config() -> EmailConfig | None:
+    """Trade-close email notifications are optional. Returns None (never
+    raises) when unset, so an incomplete/missing email setup can never
+    prevent the trading loop itself from starting or running - this is a
+    convenience on top of trading, not part of it.
+    """
+    load_dotenv(REPO_ROOT / ".env")
+
+    username = os.environ.get("ICLOUD_SMTP_USERNAME")
+    app_password = os.environ.get("ICLOUD_SMTP_APP_PASSWORD")
+    if not username or not app_password:
+        return None
+
+    return EmailConfig(
+        smtp_username=username,
+        smtp_app_password=app_password,
+        to_address=os.environ.get("TRADE_NOTIFY_TO") or username,
+    )

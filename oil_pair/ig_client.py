@@ -76,11 +76,11 @@ class IGClient:
             self._credentials.username,
             self._credentials.password,
             self._credentials.api_key,
-            acc_type="demo",
+            acc_type=self._credentials.acc_type,
             acc_number=self._credentials.acc_number,
         )
         self._service.create_session(version="2")
-        log.info("logged in to IG demo API as %s", self._credentials.username)
+        log.info("logged in to IG %s API as %s", self._credentials.acc_type, self._credentials.username)
 
     @property
     def service(self) -> IGService:

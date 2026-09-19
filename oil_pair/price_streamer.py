@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import replace
 
 from lightstreamer.client import Subscription, SubscriptionListener
 from trading_ig import IGStreamService
@@ -42,6 +43,7 @@ class PriceStreamer:
         self._latest: dict[str, Snapshot] = {}
         self._last_updated_at: dict[str, float] = {}
         self._stream_service: IGStreamService | None = None
+        self._subscription_broken = threading.Event()
 
     def start(self) -> None:
         self._stream_service = IGStreamService(self._ig_client.service)
@@ -50,24 +52,58 @@ class PriceStreamer:
         # number as the LS username alongside the CST/XST token password.
         self._stream_service.acc_number = self._ig_client.credentials.acc_number
         self._stream_service.create_session(version="2")
+        self._stream_service.subscribe(self._build_subscription())
+        log.info("price stream subscribed: %s", self._epics)
 
+    def _build_subscription(self) -> Subscription:
         subscription = Subscription(
             mode="MERGE",
             items=[f"MARKET:{epic}" for epic in self._epics],
             fields=STREAM_FIELDS,
         )
         subscription.addListener(_MarketListener(self))
-        self._stream_service.subscribe(subscription)
-        log.info("price stream subscribed: %s", self._epics)
+        return subscription
+
+    def _mark_subscription_broken(self) -> None:
+        self._subscription_broken.set()
+
+    def subscription_is_broken(self) -> bool:
+        return self._subscription_broken.is_set()
+
+    def resubscribe(self) -> None:
+        """Re-subscribes after IG tore down the previous subscription -
+        observed at a weekend market close as onUnsubscription followed by
+        onSubscriptionError(code=21, "Invalid group"), with no automatic
+        client-side reconnect. Safe to call repeatedly: while the market
+        stays closed IG simply won't deliver any prices against the new
+        subscription either, but the call itself succeeds, so the caller
+        (main.py's loop) can retry this every iteration indefinitely
+        without it counting as an error - it self-heals once IG accepts
+        the subscription again (e.g. the next session's reopen).
+        """
+        self._subscription_broken.clear()
+        self._stream_service.subscribe(self._build_subscription())
 
     def _handle_update(self, epic: str, bid: float | None, offer: float | None, market_status: str | None) -> None:
-        if bid is None or offer is None:
-            return
         with self._lock:
-            self._latest[epic] = Snapshot(
-                bid=bid, offer=offer, mid=(bid + offer) / 2, market_status=market_status or "UNKNOWN"
-            )
-            self._last_updated_at[epic] = time.monotonic()
+            if bid is not None and offer is not None:
+                self._latest[epic] = Snapshot(
+                    bid=bid, offer=offer, mid=(bid + offer) / 2, market_status=market_status or "UNKNOWN"
+                )
+                self._last_updated_at[epic] = time.monotonic()
+            elif epic in self._latest and market_status is not None:
+                # A market closing (e.g. for the weekend) can push a
+                # MARKET_STATE change with no valid BID/OFFER - there's no
+                # tradeable quote once it's closed. Dropping that whole
+                # update (as before) silently discarded the status change
+                # along with the missing price, so peek_snapshot() kept
+                # reporting "TRADEABLE" straight through the close and the
+                # loop kept demanding fresh prices until staleness tripped
+                # MAX_CONSECUTIVE_ERRORS - the exact crash this was meant to
+                # prevent. Keep the last known price but record the status
+                # change; deliberately do NOT refresh _last_updated_at since
+                # there is no new price and staleness must keep growing.
+                self._latest[epic] = replace(self._latest[epic], market_status=market_status)
 
     def wait_for_initial_prices(self, timeout: float = DEFAULT_INITIAL_PRICE_TIMEOUT_SECONDS) -> None:
         deadline = time.monotonic() + timeout
@@ -137,6 +173,8 @@ class _MarketListener(SubscriptionListener):
 
     def onSubscriptionError(self, code, message) -> None:
         log.error("price stream subscription error: code=%s message=%s", code, message)
+        self._streamer._mark_subscription_broken()
 
     def onUnsubscription(self) -> None:
         log.warning("price stream unsubscribed")
+        self._streamer._mark_subscription_broken()

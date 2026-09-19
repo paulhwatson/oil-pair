@@ -1,8 +1,9 @@
-# oil_pair — multi-pair pairs trader (IG demo)
+# oil_pair — multi-pair pairs trader (IG demo/live)
 
 A standalone pairs-trading app using IG Markets for both price data and
-execution. Self-contained — no dependency on any other repo. **Hardcoded to
-IG's demo API only.**
+execution. Self-contained — no dependency on any other repo. **Trades IG's
+demo API by default; real-money trading requires explicitly passing `--live`
+on the command line (see "Safety notes").**
 
 Runs one pair per process, each identified by a `<pair_name>` (e.g.
 `brent_gasoline`, `brent_wti`) that namespaces its own config, state,
@@ -72,6 +73,13 @@ rolls to a new expiry.
 ./.venv/bin/python -m oil_pair.main brent_gasoline
 ```
 
+Trades IG's demo API by default. Pass `--live` to trade the real account
+instead (see "Safety notes"):
+
+```bash
+./.venv/bin/python -m oil_pair.main brent_gasoline --live
+```
+
 Logs to `logs/<pair_name>/oil_pair.log` (rotating) and stdout.
 
 ## Running multiple pairs
@@ -94,6 +102,35 @@ so two *different* pairs never interfere with each other. Starting the
 instance lock is a local file, so it only stops two processes on the same
 machine. Never run the same `<pair_name>` on two machines against the same
 IG account at once.
+
+## Trade-close email notifications
+
+Optional. When a pair trade fully closes (both legs), the app can email a
+plain-text summary — side, entry/exit spread, per-leg entry/exit mid price,
+duration, and an estimated P&L — via iCloud Mail, so it shows up on your
+phone through the stock Mail app with no extra software needed. Sending is
+best-effort: a failed or unconfigured email never affects trading itself,
+it's purely a notification layered on top (see `oil_pair/notifications.py`).
+
+To enable it, set in `.env` (see `.env.example`):
+
+```
+ICLOUD_SMTP_USERNAME=you@icloud.com
+ICLOUD_SMTP_APP_PASSWORD=...
+```
+
+`ICLOUD_SMTP_APP_PASSWORD` is **not** your Apple ID password — generate a
+dedicated app-specific password at
+[appleid.apple.com](https://appleid.apple.com) under "Sign-In and Security"
+→ "App-Specific Passwords". Notifications go to `ICLOUD_SMTP_USERNAME`
+itself unless `TRADE_NOTIFY_TO` is also set to a different address. Leaving
+both unset disables the feature entirely — nothing changes about how the
+app trades either way.
+
+The summary only covers trades entered and closed within the same process
+run — entry details aren't persisted to `run_state.json`, so a position
+that was already open before a restart (and later closes) won't get an
+email, same as the "no auto-flatten on shutdown" limitation below.
 
 ## Manually closing a position
 
@@ -166,9 +203,16 @@ dependency required to run the test suite.
 
 ## Safety notes
 
-- `acc_type` is hardcoded to `"demo"` in `oil_pair/ig_client.py` — there is
-  no code path in this app that can place a live order, even if live
-  credentials were added to `.env`.
+- **Demo is the default; live requires an explicit `--live` flag.** Without
+  it, `load_credentials()` only ever reads the `IG_DEMO_*` vars, and
+  `IGClient` logs in against IG's demo API. There is no env var that alone
+  switches this - the flag has to be passed on the command line every time,
+  so a real account can't get traded by an env var left over from a
+  previous session.
+- **Demo and live credentials live in separate `.env` namespaces**
+  (`IG_DEMO_*` vs `IG_LIVE_*`, see `.env.example`) - `--live` only ever
+  reads `IG_LIVE_*`, so a typo can't point one account's credentials at the
+  other.
 - `.env` (real credentials) and `logs/` are gitignored.
 - If two consecutive-error iterations exceed `MAX_CONSECUTIVE_ERRORS` (10),
   the app exits loudly rather than spinning silently — check the logs.

@@ -1,12 +1,14 @@
-"""Live trading loop: Brent Crude vs. gasoline pairs strategy on IG demo."""
+"""Live trading loop: Brent Crude vs. gasoline pairs strategy on IG. Trades
+IG's demo API by default; pass --live to trade the real account instead
+(see load_credentials)."""
 
 from __future__ import annotations
 
+import argparse
 import logging
 import signal
-import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pandas as pd
@@ -15,9 +17,18 @@ from trading_ig.rest import ApiExceededException, IGException, TokenInvalidExcep
 from oil_pair import instance_lock, price_log
 from oil_pair.ig_client import IGClient
 from oil_pair.logging_setup import configure_logging
+from oil_pair.notifications import LegSummary, TradeSummary, send_trade_summary_email
 from oil_pair.paths import PairPaths, resolve as resolve_paths
 from oil_pair.price_streamer import PriceStreamer
-from oil_pair.settings import InstrumentConfig, PairConfig, StrategyConfig, load_credentials, load_pair_config
+from oil_pair.settings import (
+    EmailConfig,
+    InstrumentConfig,
+    PairConfig,
+    StrategyConfig,
+    load_credentials,
+    load_email_config,
+    load_pair_config,
+)
 from oil_pair.state_store import LegPosition, RunState, StateCorruptedError, load_state, save_state
 from oil_pair.strategy_logic import (
     MIN_FIT_OBSERVATIONS,
@@ -36,6 +47,20 @@ MAX_CONSECUTIVE_ERRORS = 10
 SPREAD_LOG_INTERVAL_SECONDS = 60
 
 _shutdown_requested = False
+
+
+@dataclass(frozen=True)
+class _OpenTradeContext:
+    """Captured at ENTER, consumed when the position is next confirmed fully
+    FLAT, to let the trade-close email report entry-side details without
+    persisting them to run_state.json. Lost on a process restart mid-trade
+    (same as refit_buffer below) - a trade that outlives a restart just
+    doesn't get an email, since there is nothing left to compare against."""
+    side: PairSide
+    entered_at: pd.Timestamp
+    entry_spread: float
+    entry_mids: dict[str, float]
+    entry_model: Model
 
 
 def _handle_shutdown_signal(signum, frame):
@@ -257,11 +282,14 @@ def apply_decision(
     return replace(state, leg_a=remaining_leg_a, leg_b=remaining_leg_b, stopped_out=decision.stopped_out)
 
 
-def run(pair_name: str) -> None:
+def run(pair_name: str, live: bool = False) -> None:
     paths = resolve_paths(pair_name)
     configure_logging(log_dir=paths.log_dir)
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+
+    if live:
+        log.warning("LIVE TRADING MODE - orders will be placed against a real IG account, not the demo API")
 
     try:
         instance_lock.acquire(paths.instance_lock)
@@ -274,13 +302,13 @@ def run(pair_name: str) -> None:
         raise SystemExit(1) from exc
 
     try:
-        _run_locked(paths)
+        _run_locked(paths, live=live)
     finally:
         instance_lock.release(paths.instance_lock)
 
 
-def _run_locked(paths: PairPaths) -> None:
-    creds = load_credentials()
+def _run_locked(paths: PairPaths, live: bool = False) -> None:
+    creds = load_credentials(live=live)
     pair_config = load_pair_config(paths.pair_config)
 
     client = IGClient(creds)
@@ -299,9 +327,68 @@ def _run_locked(paths: PairPaths) -> None:
         epic_b: client.get_dealing_rules(epic_b),
     }
 
+    email_config = load_email_config()
+    log.info(
+        "trade-close email notifications %s",
+        f"enabled (to {email_config.to_address})" if email_config
+        else "disabled (set ICLOUD_SMTP_USERNAME/ICLOUD_SMTP_APP_PASSWORD in .env to enable)",
+    )
+
+    def _notify_trade_closed(
+        context: _OpenTradeContext, decision, exited_at: pd.Timestamp, exit_spread: float, exit_mids: dict[str, float]
+    ) -> None:
+        # A notification is a convenience on top of trading, not part of it -
+        # any failure here (bad credentials, network blip, IG-unrelated SMTP
+        # error) must be swallowed and logged, never allowed to count toward
+        # MAX_CONSECUTIVE_ERRORS or otherwise disrupt the loop above.
+        try:
+            model = context.entry_model
+            legs = [
+                LegSummary(
+                    epic=epic,
+                    direction=direction_for_leg(context.side, is_i1_leg=(epic == model.i1_key)),
+                    size=compute_leg_size(pair_config.strategy.notional_trade_size, context.entry_mids[epic], rules[epic]),
+                    entry_mid=context.entry_mids[epic],
+                    exit_mid=exit_mids[epic],
+                )
+                for epic in (epic_a, epic_b)
+            ]
+            summary = TradeSummary(
+                pair_name=paths.pair_name,
+                side=context.side,
+                action=decision.action,
+                reason=decision.reason,
+                entered_at=context.entered_at,
+                exited_at=exited_at,
+                entry_spread=context.entry_spread,
+                exit_spread=exit_spread,
+                std_spread=model.std_spread,
+                currency_code=pair_config.instrument_a.currency_code,
+                legs=legs,
+            )
+            send_trade_summary_email(email_config, summary)
+        except Exception:
+            log.exception("failed to send trade-close notification email (trade itself is unaffected)")
+
     streamer = PriceStreamer(client, [epic_a, epic_b])
     streamer.start()
-    streamer.wait_for_initial_prices()
+    try:
+        streamer.wait_for_initial_prices()
+    except TimeoutError:
+        # Starting up while the market is already closed (e.g. restarting
+        # over a weekend) makes IG reject the subscription outright - see
+        # subscription_is_broken() - so no initial price will ever arrive
+        # here no matter how long this waits. Only treat the timeout as
+        # fatal when that's NOT what happened (e.g. a typo'd epic that IG
+        # silently never sends data for) - that should still fail fast
+        # instead of looping forever with nothing to show for it.
+        if not streamer.subscription_is_broken():
+            raise
+        log.warning(
+            "no initial prices within timeout, and the price stream subscription is broken "
+            "(market likely already closed) - entering the main loop anyway; it will keep "
+            "attempting to resubscribe until the market opens"
+        )
 
     # Seeded from the local price_log cache (built by this app's own past
     # runs) plus freshly streamed prices - no historical-data REST call, so
@@ -334,6 +421,8 @@ def _run_locked(paths: PairPaths) -> None:
     refit_buffer: list[tuple[pd.Timestamp, float, float]] = []
     next_refit_at: pd.Timestamp | None = None
     next_spread_log_at: pd.Timestamp | None = None
+    open_trade_context: _OpenTradeContext | None = None
+    subscription_was_broken = False
 
     consecutive_errors = 0
     log.info(
@@ -343,6 +432,32 @@ def _run_locked(paths: PairPaths) -> None:
     try:
         while not _shutdown_requested:
             try:
+                # IG tears the whole Lightstreamer subscription down (not
+                # just a quiet item) when a market closes for the weekend -
+                # observed as onUnsubscription + onSubscriptionError(code=21,
+                # "Invalid group") with no automatic client-side reconnect.
+                # Left alone, no further price update ever arrives, so
+                # peek_snapshot()'s cached status never changes and
+                # latest_snapshot() eventually raises on staleness instead -
+                # exactly the crash this whole tradeability check exists to
+                # prevent. Resubscribing is safe to retry every iteration:
+                # it's a no-op error (not counted against
+                # MAX_CONSECUTIVE_ERRORS) for as long as the market stays
+                # closed, and self-heals once IG accepts the subscription
+                # again (e.g. the Sunday evening reopen).
+                if streamer.subscription_is_broken():
+                    if not subscription_was_broken:
+                        log.warning(
+                            "price stream subscription is broken (market likely closed) - will keep "
+                            "attempting to resubscribe automatically until it recovers"
+                        )
+                        subscription_was_broken = True
+                    streamer.resubscribe()
+                    consecutive_errors = 0
+                    time.sleep(pair_config.strategy.poll_interval_seconds)
+                    continue
+                subscription_was_broken = False
+
                 # Check tradeability from whatever's cached (possibly stale -
                 # e.g. over a weekend, nothing has arrived in a while because
                 # nothing is trading, not because the stream is broken)
@@ -388,8 +503,24 @@ def _run_locked(paths: PairPaths) -> None:
                         decision = next_decision(spread, model, state.side, state.stopped_out)
                         if decision.action is not Action.NONE:
                             log.info("decision: %s reason=%r spread=%.6f", decision.action, decision.reason, spread)
+
+                        if decision.action is Action.ENTER:
+                            open_trade_context = _OpenTradeContext(
+                                side=decision.side, entered_at=now, entry_spread=spread,
+                                entry_mids=dict(mids), entry_model=model,
+                            )
+
                         state = apply_decision(client, decision, state, pair_config, model, rules, mids)
                         save_state(state, paths.state)
+
+                        if (
+                            decision.action in (Action.EXIT_TAKE_PROFIT, Action.EXIT_STOP_LOSS)
+                            and state.side is PairSide.FLAT
+                            and open_trade_context is not None
+                        ):
+                            if email_config is not None:
+                                _notify_trade_closed(open_trade_context, decision, now, spread, mids)
+                            open_trade_context = None
 
                         if now >= next_refit_at and len(refit_buffer) >= 2:
                             model = refit_model(refit_buffer, pair_config, epic_a, epic_b)
@@ -424,7 +555,13 @@ def _run_locked(paths: PairPaths) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print(f"usage: {sys.argv[0]} <pair_name>  (e.g. brent_gasoline - matches a directory under config/)")
-        raise SystemExit(1)
-    run(sys.argv[1])
+    parser = argparse.ArgumentParser(
+        description="Pairs-trading loop for IG Markets. Trades the demo API by default."
+    )
+    parser.add_argument("pair_name", help="matches a directory under config/, e.g. brent_gasoline")
+    parser.add_argument(
+        "--live", action="store_true",
+        help="trade IG's LIVE account (real money, IG_LIVE_* credentials) instead of the default demo account",
+    )
+    args = parser.parse_args()
+    run(args.pair_name, live=args.live)
