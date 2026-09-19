@@ -11,7 +11,7 @@ expiry = "DFB"
 currency_code = "GBP"
 
 [strategy]
-notional_trade_size = 1000
+notional_trade_size = 2000
 model_update_interval_business_days = 7
 entry_stds = 1.5
 limit_stds = 1.0
