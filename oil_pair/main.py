@@ -8,7 +8,7 @@ import argparse
 import logging
 import signal
 import time
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
@@ -17,18 +17,10 @@ from trading_ig.rest import ApiExceededException, IGException, TokenInvalidExcep
 from oil_pair import instance_lock, price_log
 from oil_pair.ig_client import IGClient
 from oil_pair.logging_setup import configure_logging
-from oil_pair.notifications import LegSummary, TradeSummary, send_trade_summary_email
+from oil_pair.notify import Notifier, load_email_config
 from oil_pair.paths import PairPaths, resolve as resolve_paths
 from oil_pair.price_streamer import PriceStreamer
-from oil_pair.settings import (
-    EmailConfig,
-    InstrumentConfig,
-    PairConfig,
-    StrategyConfig,
-    load_credentials,
-    load_email_config,
-    load_pair_config,
-)
+from oil_pair.settings import InstrumentConfig, PairConfig, StrategyConfig, load_credentials, load_pair_config
 from oil_pair.state_store import LegPosition, RunState, StateCorruptedError, load_state, save_state
 from oil_pair.strategy_logic import (
     MIN_FIT_OBSERVATIONS,
@@ -49,27 +41,15 @@ SPREAD_LOG_INTERVAL_SECONDS = 60
 _shutdown_requested = False
 
 
-@dataclass(frozen=True)
-class _OpenTradeContext:
-    """Captured at ENTER, consumed when the position is next confirmed fully
-    FLAT, to let the trade-close email report entry-side details without
-    persisting them to run_state.json. Lost on a process restart mid-trade
-    (same as refit_buffer below) - a trade that outlives a restart just
-    doesn't get an email, since there is nothing left to compare against."""
-    side: PairSide
-    entered_at: pd.Timestamp
-    entry_spread: float
-    entry_mids: dict[str, float]
-    entry_model: Model
-
-
 def _handle_shutdown_signal(signum, frame):
     global _shutdown_requested
     log.info("shutdown signal received (%s), finishing current iteration then exiting", signum)
     _shutdown_requested = True
 
 
-def reconcile_positions(client: IGClient, pair_config: PairConfig, state_path: Path) -> RunState:
+def reconcile_positions(
+    client: IGClient, pair_config: PairConfig, state_path: Path, notifier: Notifier | None = None
+) -> RunState:
     """Resumes state from the local state file, keyed by deal_id - NOT by
     scanning IG for "any position on epic_a/epic_b", since other strategies
     or manual trades may hold positions on the same instruments. A missing
@@ -107,6 +87,13 @@ def reconcile_positions(client: IGClient, pair_config: PairConfig, state_path: P
         )
         opposite = "SELL" if leg.direction == "BUY" else "BUY"
         client.close_market_position(deal_id=leg.deal_id, direction=opposite, size=row["size"], epic=instrument.epic)
+        if notifier is not None:
+            notifier.send(
+                f"Closed {saved.side.value} pair on startup",
+                f"While the app was down, one leg of the {saved.side.value} pair was closed outside the app.\n"
+                f"Closed the remaining {instrument.name} leg ({instrument.epic}, deal {leg.deal_id}) to avoid "
+                f"unhedged exposure. Now FLAT.",
+            )
     else:
         log.info("tracked pair position was already closed while this app was down - resetting to FLAT")
 
@@ -118,6 +105,19 @@ def _combined_series(cached: pd.Series, buffered: list[tuple[pd.Timestamp, float
         return cached
     buffered_series = pd.Series([value for _, value in buffered], index=[ts for ts, _ in buffered])
     return pd.concat([cached, buffered_series]).sort_index()
+
+
+def _fit_window(series: pd.Series, now: pd.Timestamp, lookback_days: int) -> pd.Series:
+    """The most recent `lookback_days` of a series.
+
+    price_log/ticks.csv grows without bound across runs, so an unbounded fit
+    would eventually weight a regime from months ago as heavily as this week's.
+    Bounding the window here is what lets the cache keep everything while the
+    model only ever sees recent history.
+    """
+    if series.empty or lookback_days <= 0:
+        return series
+    return series[series.index >= now - pd.Timedelta(days=lookback_days)]
 
 
 def try_build_initial_model(
@@ -134,13 +134,25 @@ def try_build_initial_model(
     oil_pair/price_log.py). Returns None while there isn't yet enough data
     (both a minimum point count and a minimum time span) - the caller keeps
     accumulating and retrying each iteration until this returns a Model.
+
+    The two limits work in opposite directions: warmup_minutes is the minimum
+    span needed before trading at all, max_fit_lookback_days the maximum span
+    fitted on. A cold start waits for the former; a restart against a cache
+    that already holds months of ticks fits immediately, on the latter.
     """
-    combined_a = _combined_series(cached_a, [(ts, a) for ts, a, _ in buffer])
-    combined_b = _combined_series(cached_b, [(ts, b) for ts, _, b in buffer])
+    combined_a = _fit_window(
+        _combined_series(cached_a, [(ts, a) for ts, a, _ in buffer]), now, strategy.max_fit_lookback_days
+    )
+    combined_b = _fit_window(
+        _combined_series(cached_b, [(ts, b) for ts, _, b in buffer]), now, strategy.max_fit_lookback_days
+    )
 
     if len(combined_a) < MIN_FIT_OBSERVATIONS or len(combined_b) < MIN_FIT_OBSERVATIONS:
         return None
 
+    # Measured on the windowed data, since that is what actually gets fitted -
+    # a cache reaching further back than the window does not shorten the wait,
+    # but it must not be allowed to fake it either.
     earliest = min(combined_a.index.min(), combined_b.index.min())
     span_minutes = (now - earliest).total_seconds() / 60
     if span_minutes < strategy.warmup_minutes:
@@ -153,17 +165,48 @@ def try_build_initial_model(
         stop_stds=strategy.stop_stds,
     )
     log.info(
-        "initial fit ready (%.1f min of data, %d+%d points): i1=%s i2=%s hedge_ratio=%.6f std_spread=%.6f",
-        span_minutes, len(cached_a), len(buffer), model.i1_key, model.i2_key, model.hedge_ratio, model.std_spread,
+        "initial fit ready (%.1f h of data within a %d-day window, %d+%d points): "
+        "i1=%s i2=%s hedge_ratio=%.6f std_spread=%.6f",
+        span_minutes / 60, strategy.max_fit_lookback_days, len(combined_a), len(combined_b),
+        model.i1_key, model.i2_key, model.hedge_ratio, model.std_spread,
     )
     return model
 
 
-def refit_model(buffer: list[tuple[pd.Timestamp, float, float]], pair_config: PairConfig, epic_a: str, epic_b: str) -> Model:
-    index = [row[0] for row in buffer]
-    series_a = pd.Series([row[1] for row in buffer], index=index)
-    series_b = pd.Series([row[2] for row in buffer], index=index)
+def refit_model(
+    pair_config: PairConfig,
+    epic_a: str,
+    epic_b: str,
+    price_log_path: Path,
+    now: pd.Timestamp,
+) -> Model | None:
+    """Refits on up to max_fit_lookback_days of cached prices.
+
+    Reads price_log/ticks.csv rather than an in-memory buffer of ticks since
+    the last fit: that buffer only ever holds one refit interval, which is
+    less than the lookback this is supposed to use. Every tick is appended to
+    the log as it arrives, so the log is a superset of any such buffer and
+    concatenating both would double-count everything since the last fit.
+
+    Returns None when the window holds too few aligned observations to fit -
+    the caller keeps the model it already has rather than dropping to none
+    mid-position.
+    """
     strategy = pair_config.strategy
+    series_a = _fit_window(
+        price_log.load_mid_series(epic_a, price_log_path), now, strategy.max_fit_lookback_days
+    )
+    series_b = _fit_window(
+        price_log.load_mid_series(epic_b, price_log_path), now, strategy.max_fit_lookback_days
+    )
+
+    if len(series_a) < MIN_FIT_OBSERVATIONS or len(series_b) < MIN_FIT_OBSERVATIONS:
+        log.warning(
+            "refit skipped: only %d/%d points in the last %d day(s), need %d each",
+            len(series_a), len(series_b), strategy.max_fit_lookback_days, MIN_FIT_OBSERVATIONS,
+        )
+        return None
+
     return fit_model(
         {epic_a: series_a, epic_b: series_b},
         entry_stds=strategy.entry_stds,
@@ -179,6 +222,12 @@ def direction_for_leg(side: PairSide, is_i1_leg: bool) -> str:
     return "BUY" if is_i1_leg else "SELL"
 
 
+def _spread_summary(model: Model, mids: dict[str, float]) -> str:
+    spread = compute_spread(mids[model.i1_key], mids[model.i2_key], model.hedge_ratio)
+    stds = spread / model.std_spread if model.std_spread else float("nan")
+    return f"spread={spread:.6f} ({stds:.2f} std), hedge_ratio={model.hedge_ratio:.6f}"
+
+
 def apply_decision(
     client: IGClient,
     decision,
@@ -187,6 +236,7 @@ def apply_decision(
     model: Model,
     rules: dict[str, float],
     mids: dict[str, float],
+    notifier: Notifier | None = None,
 ) -> RunState:
     instruments: dict[str, InstrumentConfig] = {
         pair_config.instrument_a.epic: pair_config.instrument_a,
@@ -222,6 +272,14 @@ def apply_decision(
             raise
 
         log.info("ENTER %s: %s %s size=%s, %s %s size=%s", decision.side, direction_i1, epic_i1, size_i1, direction_i2, epic_i2, size_i2)
+        if notifier is not None:
+            notifier.send(
+                f"Opened {decision.side.value} pair",
+                f"{decision.reason}\n\n"
+                f"{direction_i1} {size_i1} {instruments[epic_i1].name} ({epic_i1}) at ~{mids[epic_i1]}, deal {result_i1['dealId']}\n"
+                f"{direction_i2} {size_i2} {instruments[epic_i2].name} ({epic_i2}) at ~{mids[epic_i2]}, deal {result_i2['dealId']}\n\n"
+                f"{_spread_summary(model, mids)}",
+            )
         leg_i1 = LegPosition(deal_id=result_i1["dealId"], direction=direction_i1)
         leg_i2 = LegPosition(deal_id=result_i2["dealId"], direction=direction_i2)
         leg_a = leg_i1 if epic_i1 == pair_config.instrument_a.epic else leg_i2
@@ -278,6 +336,15 @@ def apply_decision(
     remaining_leg_b = _close_leg(state.leg_b, pair_config.instrument_b)
 
     if remaining_leg_a is None and remaining_leg_b is None:
+        if notifier is not None:
+            outcome = "take profit" if decision.action is Action.EXIT_TAKE_PROFIT else "stop loss"
+            notifier.send(
+                f"Closed {state.side.value} pair ({outcome})",
+                f"{decision.reason}\n\n"
+                f"Closed both legs: {pair_config.instrument_a.name} at ~{mids[pair_config.instrument_a.epic]}, "
+                f"{pair_config.instrument_b.name} at ~{mids[pair_config.instrument_b.epic]}.\n\n"
+                f"{_spread_summary(model, mids)}",
+            )
         return RunState(side=PairSide.FLAT, stopped_out=decision.stopped_out)
     return replace(state, leg_a=remaining_leg_a, leg_b=remaining_leg_b, stopped_out=decision.stopped_out)
 
@@ -311,11 +378,13 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
     creds = load_credentials(live=live)
     pair_config = load_pair_config(paths.pair_config)
 
+    notifier = Notifier(paths.pair_name, load_email_config())
+
     client = IGClient(creds)
     client.login()
 
     try:
-        state = reconcile_positions(client, pair_config, paths.state)
+        state = reconcile_positions(client, pair_config, paths.state, notifier)
     except StateCorruptedError as exc:
         log.critical("%s", exc)
         raise SystemExit(1) from exc
@@ -327,67 +396,25 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
         epic_b: client.get_dealing_rules(epic_b),
     }
 
-    email_config = load_email_config()
-    log.info(
-        "trade-close email notifications %s",
-        f"enabled (to {email_config.to_address})" if email_config
-        else "disabled (set ICLOUD_SMTP_USERNAME/ICLOUD_SMTP_APP_PASSWORD in .env to enable)",
-    )
-
-    def _notify_trade_closed(
-        context: _OpenTradeContext, decision, exited_at: pd.Timestamp, exit_spread: float, exit_mids: dict[str, float]
-    ) -> None:
-        # A notification is a convenience on top of trading, not part of it -
-        # any failure here (bad credentials, network blip, IG-unrelated SMTP
-        # error) must be swallowed and logged, never allowed to count toward
-        # MAX_CONSECUTIVE_ERRORS or otherwise disrupt the loop above.
-        try:
-            model = context.entry_model
-            legs = [
-                LegSummary(
-                    epic=epic,
-                    direction=direction_for_leg(context.side, is_i1_leg=(epic == model.i1_key)),
-                    size=compute_leg_size(pair_config.strategy.notional_trade_size, context.entry_mids[epic], rules[epic]),
-                    entry_mid=context.entry_mids[epic],
-                    exit_mid=exit_mids[epic],
-                )
-                for epic in (epic_a, epic_b)
-            ]
-            summary = TradeSummary(
-                pair_name=paths.pair_name,
-                side=context.side,
-                action=decision.action,
-                reason=decision.reason,
-                entered_at=context.entered_at,
-                exited_at=exited_at,
-                entry_spread=context.entry_spread,
-                exit_spread=exit_spread,
-                std_spread=model.std_spread,
-                currency_code=pair_config.instrument_a.currency_code,
-                legs=legs,
-            )
-            send_trade_summary_email(email_config, summary)
-        except Exception:
-            log.exception("failed to send trade-close notification email (trade itself is unaffected)")
-
     streamer = PriceStreamer(client, [epic_a, epic_b])
     streamer.start()
     try:
         streamer.wait_for_initial_prices()
     except TimeoutError:
-        # Starting up while the market is already closed (e.g. restarting
-        # over a weekend) makes IG reject the subscription outright - see
-        # subscription_is_broken() - so no initial price will ever arrive
-        # here no matter how long this waits. Only treat the timeout as
-        # fatal when that's NOT what happened (e.g. a typo'd epic that IG
-        # silently never sends data for) - that should still fail fast
-        # instead of looping forever with nothing to show for it.
-        if not streamer.subscription_is_broken():
-            raise
+        # Real incident: this used to only tolerate the timeout when
+        # subscription_is_broken() was true, re-raising (crashing the
+        # process, uncaught) otherwise - on the assumption that a clean
+        # subscribe with no price within 15s meant a bad epic. That doesn't
+        # hold for CHART:<epic>:TICK (DISTINCT mode): unlike the old
+        # MARKET:<epic> (MERGE mode), it pushes nothing at all until the
+        # next genuine tick, so a brief quiet moment can outlast the
+        # timeout on a perfectly healthy subscription. A typo'd epic is
+        # already caught earlier and loudly, via get_dealing_rules()'s REST
+        # call above - this one can simply wait; the main loop already
+        # handles "no price yet" as "not tradeable, skip" indefinitely.
         log.warning(
-            "no initial prices within timeout, and the price stream subscription is broken "
-            "(market likely already closed) - entering the main loop anyway; it will keep "
-            "attempting to resubscribe until the market opens"
+            "no initial prices within timeout - entering the main loop anyway; CHART:<epic>:TICK "
+            "only pushes on a genuine new tick, so this can happen on a healthy subscription too"
         )
 
     # Seeded from the local price_log cache (built by this app's own past
@@ -396,32 +423,34 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
     # until enough data has accumulated; see try_build_initial_model.
     cached_a = price_log.load_mid_series(epic_a, paths.price_log)
     cached_b = price_log.load_mid_series(epic_b, paths.price_log)
-    warmup_minutes = pair_config.strategy.warmup_minutes
-    cache_starts = [s.index.min() for s in (cached_a, cached_b) if not s.empty]
-    # Until this fit lands, the only per-iteration log line is the debug-level
-    # "market not tradeable" skip - nothing at INFO - so a quiet log here looks
-    # identical to a hung process. Log when to expect it, so "why has nothing
-    # logged in N minutes" is answerable from the log alone.
-    if cache_starts:
-        expected_fit_at = min(cache_starts) + pd.Timedelta(minutes=warmup_minutes)
+    strategy = pair_config.strategy
+    if cached_a.empty and cached_b.empty:
         log.info(
-            "loaded local price cache (earliest=%s) - expecting first fit around %s, "
-            "no periodic logging before then",
-            min(cache_starts).isoformat(), expected_fit_at.isoformat(),
+            "no local price cache yet - warming up for %.1f h before the first fit",
+            strategy.warmup_minutes / 60,
         )
     else:
-        expected_fit_at = pd.Timestamp.now(tz="UTC") + pd.Timedelta(minutes=warmup_minutes)
+        # Only over whichever series actually has ticks: one epic can be empty
+        # while the other isn't (a renamed epic, or a crash between the two
+        # append_tick calls), and .index.min() on an empty series is NaT.
+        earliest = [s.index.min() for s in (cached_a, cached_b) if not s.empty]
+        cached_span_hours = (
+            pd.Timestamp.now(tz="UTC") - min(earliest)
+        ).total_seconds() / 3600
         log.info(
-            "no local price cache yet - warming up for %d min before the first fit "
-            "(expected around %s), no periodic logging before then",
-            warmup_minutes, expected_fit_at.isoformat(),
+            "local price cache spans %.1f h (%d+%d ticks); fits use at most %d day(s) of it, "
+            "and need %.1f h before the first one",
+            cached_span_hours, len(cached_a), len(cached_b),
+            strategy.max_fit_lookback_days, strategy.warmup_minutes / 60,
         )
 
     model: Model | None = None
-    refit_buffer: list[tuple[pd.Timestamp, float, float]] = []
+    # Only holds ticks until the first fit lands. Refits read the price log
+    # instead (see refit_model), so nothing accumulates here for the life of
+    # the process.
+    warmup_buffer: list[tuple[pd.Timestamp, float, float]] = []
     next_refit_at: pd.Timestamp | None = None
     next_spread_log_at: pd.Timestamp | None = None
-    open_trade_context: _OpenTradeContext | None = None
     subscription_was_broken = False
 
     consecutive_errors = 0
@@ -432,24 +461,22 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
     try:
         while not _shutdown_requested:
             try:
-                # IG tears the whole Lightstreamer subscription down (not
-                # just a quiet item) when a market closes for the weekend -
-                # observed as onUnsubscription + onSubscriptionError(code=21,
-                # "Invalid group") with no automatic client-side reconnect.
-                # Left alone, no further price update ever arrives, so
-                # peek_snapshot()'s cached status never changes and
-                # latest_snapshot() eventually raises on staleness instead -
-                # exactly the crash this whole tradeability check exists to
-                # prevent. Resubscribing is safe to retry every iteration:
-                # it's a no-op error (not counted against
-                # MAX_CONSECUTIVE_ERRORS) for as long as the market stays
-                # closed, and self-heals once IG accepts the subscription
-                # again (e.g. the Sunday evening reopen).
+                # IG can tear the whole Lightstreamer subscription down (not
+                # just go quiet on an item) - observed as onUnsubscription +
+                # onSubscriptionError with no automatic client-side
+                # reconnect, which once left a process silently dead for 13
+                # days through several market opens and closes. Left alone,
+                # no further price update ever arrives, so peek_snapshot()'s
+                # cached status never changes and latest_snapshot()
+                # eventually raises on staleness instead. Resubscribing is
+                # safe to retry every iteration: it's a no-op error (not
+                # counted against MAX_CONSECUTIVE_ERRORS), and self-heals
+                # once IG accepts the subscription again.
                 if streamer.subscription_is_broken():
                     if not subscription_was_broken:
                         log.warning(
-                            "price stream subscription is broken (market likely closed) - will keep "
-                            "attempting to resubscribe automatically until it recovers"
+                            "price stream subscription is broken - will keep attempting to "
+                            "resubscribe automatically until it recovers"
                         )
                         subscription_was_broken = True
                     streamer.resubscribe()
@@ -464,7 +491,10 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
                 # before demanding a fresh snapshot. Calling latest_snapshot()
                 # unconditionally here used to raise on every iteration once
                 # markets closed, tripping MAX_CONSECUTIVE_ERRORS and exiting
-                # a couple of minutes into every weekend.
+                # a couple of minutes into every weekend. market_status comes
+                # from a periodic REST poll inside PriceStreamer itself (see
+                # price_streamer.py) - CHART:<epic>:TICK carries no status
+                # field of its own.
                 peek = streamer.peek_snapshot()
                 status_a = peek[epic_a].market_status if epic_a in peek else None
                 status_b = peek[epic_b].market_status if epic_b in peek else None
@@ -474,16 +504,16 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
                     snapshot = streamer.latest_snapshot()
                     now = pd.Timestamp.now(tz="UTC")
                     mids = {epic_a: snapshot[epic_a].mid, epic_b: snapshot[epic_b].mid}
-                    refit_buffer.append((now, mids[epic_a], mids[epic_b]))
                     price_log.append_tick(epic_a, mids[epic_a], now, paths.price_log)
                     price_log.append_tick(epic_b, mids[epic_b], now, paths.price_log)
 
                     if model is None:
+                        warmup_buffer.append((now, mids[epic_a], mids[epic_b]))
                         model = try_build_initial_model(
-                            cached_a, cached_b, refit_buffer, pair_config.strategy, epic_a, epic_b, now
+                            cached_a, cached_b, warmup_buffer, pair_config.strategy, epic_a, epic_b, now
                         )
                         if model is not None:
-                            refit_buffer.clear()
+                            warmup_buffer.clear()
                             next_refit_at = now + pd.offsets.BusinessDay(
                                 pair_config.strategy.model_update_interval_business_days
                             )
@@ -503,30 +533,20 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
                         decision = next_decision(spread, model, state.side, state.stopped_out)
                         if decision.action is not Action.NONE:
                             log.info("decision: %s reason=%r spread=%.6f", decision.action, decision.reason, spread)
-
-                        if decision.action is Action.ENTER:
-                            open_trade_context = _OpenTradeContext(
-                                side=decision.side, entered_at=now, entry_spread=spread,
-                                entry_mids=dict(mids), entry_model=model,
-                            )
-
-                        state = apply_decision(client, decision, state, pair_config, model, rules, mids)
+                        state = apply_decision(client, decision, state, pair_config, model, rules, mids, notifier)
                         save_state(state, paths.state)
 
-                        if (
-                            decision.action in (Action.EXIT_TAKE_PROFIT, Action.EXIT_STOP_LOSS)
-                            and state.side is PairSide.FLAT
-                            and open_trade_context is not None
-                        ):
-                            if email_config is not None:
-                                _notify_trade_closed(open_trade_context, decision, now, spread, mids)
-                            open_trade_context = None
-
-                        if now >= next_refit_at and len(refit_buffer) >= 2:
-                            model = refit_model(refit_buffer, pair_config, epic_a, epic_b)
-                            refit_buffer.clear()
+                        if now >= next_refit_at:
+                            refitted = refit_model(pair_config, epic_a, epic_b, paths.price_log, now)
+                            if refitted is not None:
+                                model = refitted
+                                log.info(
+                                    "refit: hedge_ratio=%.6f std_spread=%.6f",
+                                    model.hedge_ratio, model.std_spread,
+                                )
+                            # Reschedule either way: a thin window now is no
+                            # reason to retry on every single iteration.
                             next_refit_at = now + pd.offsets.BusinessDay(pair_config.strategy.model_update_interval_business_days)
-                            log.info("refit: hedge_ratio=%.6f std_spread=%.6f", model.hedge_ratio, model.std_spread)
 
                 consecutive_errors = 0
 

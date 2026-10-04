@@ -110,6 +110,7 @@ def main() -> None:
             "stop_stds": strategy_defaults.stop_stds,
             "poll_interval_seconds": strategy_defaults.poll_interval_seconds,
             "warmup_minutes": strategy_defaults.warmup_minutes,
+            "max_fit_lookback_days": strategy_defaults.max_fit_lookback_days,
         },
     }
 

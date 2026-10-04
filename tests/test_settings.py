@@ -6,7 +6,7 @@ isolated from each other."""
 import pytest
 
 from oil_pair import settings
-from oil_pair.settings import load_credentials, load_email_config
+from oil_pair.settings import load_credentials
 
 DEMO_VARS = {
     "IG_DEMO_USERNAME": "demo-user",
@@ -22,8 +22,6 @@ LIVE_VARS = {
     "IG_LIVE_ACC_NUMBER": "live-acc",
 }
 
-EMAIL_VARS = ("ICLOUD_SMTP_USERNAME", "ICLOUD_SMTP_APP_PASSWORD", "TRADE_NOTIFY_TO")
-
 
 @pytest.fixture(autouse=True)
 def clean_ig_env(monkeypatch):
@@ -31,7 +29,7 @@ def clean_ig_env(monkeypatch):
     # not leak into these tests - they exercise load_credentials()'s env-var
     # selection logic, not the developer machine's own dotenv file.
     monkeypatch.setattr(settings, "load_dotenv", lambda *args, **kwargs: None)
-    for name in (*DEMO_VARS, *LIVE_VARS, *EMAIL_VARS):
+    for name in (*DEMO_VARS, *LIVE_VARS):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -75,36 +73,3 @@ def test_missing_demo_vars_raises_with_actionable_message(monkeypatch):
 def test_missing_live_vars_raises_with_actionable_message(monkeypatch):
     with pytest.raises(RuntimeError, match="IG_LIVE_USERNAME"):
         load_credentials(live=True)
-
-
-def test_email_config_absent_when_unset(monkeypatch):
-    # Trade-close notifications are optional - must not raise, must not
-    # block startup, just come back as "disabled".
-    assert load_email_config() is None
-
-
-def test_email_config_absent_when_only_partially_set(monkeypatch):
-    monkeypatch.setenv("ICLOUD_SMTP_USERNAME", "me@icloud.com")
-
-    assert load_email_config() is None
-
-
-def test_email_config_defaults_recipient_to_sender(monkeypatch):
-    monkeypatch.setenv("ICLOUD_SMTP_USERNAME", "me@icloud.com")
-    monkeypatch.setenv("ICLOUD_SMTP_APP_PASSWORD", "app-pw")
-
-    config = load_email_config()
-
-    assert config.smtp_username == "me@icloud.com"
-    assert config.smtp_app_password == "app-pw"
-    assert config.to_address == "me@icloud.com"
-
-
-def test_email_config_uses_explicit_recipient_when_set(monkeypatch):
-    monkeypatch.setenv("ICLOUD_SMTP_USERNAME", "me@icloud.com")
-    monkeypatch.setenv("ICLOUD_SMTP_APP_PASSWORD", "app-pw")
-    monkeypatch.setenv("TRADE_NOTIFY_TO", "phone@icloud.com")
-
-    config = load_email_config()
-
-    assert config.to_address == "phone@icloud.com"

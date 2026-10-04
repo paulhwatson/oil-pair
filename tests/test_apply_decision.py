@@ -171,3 +171,54 @@ def test_enter_closes_first_leg_and_reraises_when_second_leg_fails_to_open(pair_
 
     assert client.open_calls == ["EPIC.A", "EPIC.B"]
     assert client.close_calls == ["EPIC.A"]  # corrective close of the leg that DID open
+
+
+class FakeNotifier:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, subject, body):
+        self.sent.append(subject)
+
+
+def test_enter_emails_once_when_both_legs_open(pair_config, model, rules, mids):
+    notifier = FakeNotifier()
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+    flat_state = RunState(side=PairSide.FLAT, stopped_out=False)
+
+    apply_decision(FakeClient(), decision, flat_state, pair_config, model, rules, mids, notifier)
+
+    assert notifier.sent == ["Opened SHORT pair"]
+
+
+def test_enter_does_not_email_when_second_leg_fails_to_open(pair_config, model, rules, mids):
+    notifier = FakeNotifier()
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+    flat_state = RunState(side=PairSide.FLAT, stopped_out=False)
+
+    with pytest.raises(RuntimeError):
+        apply_decision(FakeClient(fail_epics={"EPIC.B"}), decision, flat_state, pair_config, model, rules, mids, notifier)
+
+    assert notifier.sent == []
+
+
+def test_exit_emails_once_when_both_legs_close(pair_config, model, rules, mids):
+    notifier = FakeNotifier()
+    decision = Decision(action=Action.EXIT_STOP_LOSS, side=PairSide.FLAT, stopped_out=True, reason="test")
+
+    apply_decision(FakeClient(), decision, short_state(), pair_config, model, rules, mids, notifier)
+
+    assert notifier.sent == ["Closed SHORT pair (stop loss)"]
+
+
+def test_exit_does_not_email_until_the_failed_leg_closes(pair_config, model, rules, mids):
+    notifier = FakeNotifier()
+    decision = Decision(action=Action.EXIT_TAKE_PROFIT, side=PairSide.FLAT, stopped_out=False, reason="test")
+
+    partial = apply_decision(
+        FakeClient(fail_epics={"EPIC.A"}), decision, short_state(), pair_config, model, rules, mids, notifier
+    )
+    assert notifier.sent == []
+
+    apply_decision(FakeClient(), decision, partial, pair_config, model, rules, mids, notifier)
+    assert notifier.sent == ["Closed SHORT pair (take profit)"]

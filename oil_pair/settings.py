@@ -67,11 +67,16 @@ class StrategyConfig:
     limit_stds: float = 1.0
     stop_stds: float = 3.0
     poll_interval_seconds: int = 10
-    # Minutes of locally-cached streamed prices required before the first
+    # Minimum span of locally-cached streamed prices required before the first
     # hedge-ratio fit - no historical-data REST call is used (see
-    # oil_pair/price_log.py), so this only affects a cold start with no
-    # existing price_log/ticks.csv.
-    warmup_minutes: int = 30
+    # oil_pair/price_log.py), so this only bites on a cold start with no
+    # existing price_log/ticks.csv. 1440 = one day.
+    warmup_minutes: int = 1440
+    # Upper bound on how much history any fit uses, initial or refit. The
+    # warmup is the minimum needed to start; this is the maximum to fit on, so
+    # a price_log that has been accumulating for months doesn't drag an old
+    # regime into today's hedge ratio with the same weight as this week.
+    max_fit_lookback_days: int = 30
 
 
 @dataclass(frozen=True)
@@ -99,30 +104,3 @@ def load_pair_config(path: Path = DEFAULT_PAIR_CONFIG_PATH) -> PairConfig:
         raise RuntimeError(f"{path} is malformed: {exc}") from exc
 
     return PairConfig(instrument_a=instrument_a, instrument_b=instrument_b, strategy=strategy)
-
-
-@dataclass(frozen=True)
-class EmailConfig:
-    smtp_username: str
-    smtp_app_password: str
-    to_address: str
-
-
-def load_email_config() -> EmailConfig | None:
-    """Trade-close email notifications are optional. Returns None (never
-    raises) when unset, so an incomplete/missing email setup can never
-    prevent the trading loop itself from starting or running - this is a
-    convenience on top of trading, not part of it.
-    """
-    load_dotenv(REPO_ROOT / ".env")
-
-    username = os.environ.get("ICLOUD_SMTP_USERNAME")
-    app_password = os.environ.get("ICLOUD_SMTP_APP_PASSWORD")
-    if not username or not app_password:
-        return None
-
-    return EmailConfig(
-        smtp_username=username,
-        smtp_app_password=app_password,
-        to_address=os.environ.get("TRADE_NOTIFY_TO") or username,
-    )

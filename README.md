@@ -28,6 +28,26 @@ goes straight to live wiring with reasonable default thresholds, per an
 explicit choice made when building it. There is no guarantee Brent Crude and
 gasoline actually form a statistically valid mean-reverting pair.
 
+### How much data a fit uses
+
+Two settings bound it from opposite ends:
+
+- `warmup_minutes` (default 1440, i.e. one day) — the **minimum** span of
+  cached prices before the first fit happens at all. Only bites on a cold
+  start: a restart against a cache that already spans a day or more fits
+  immediately.
+- `max_fit_lookback_days` (default 30) — the **maximum** span any fit uses,
+  initial or refit. `price_log/<pair_name>/ticks.csv` grows without bound
+  across runs, and without this an old regime would eventually carry the same
+  weight as this week.
+
+So: wait for a day, then fit on up to a month, whichever is available.
+
+Both the initial fit and the refits read the price log and window it. Refits
+used to fit only on an in-memory buffer of ticks since the previous fit — one
+refit interval, about a week — which is less than the lookback they are meant
+to use.
+
 ## Setup
 
 This app has its own virtual environment (`.venv/`), separate from any other
@@ -103,34 +123,34 @@ instance lock is a local file, so it only stops two processes on the same
 machine. Never run the same `<pair_name>` on two machines against the same
 IG account at once.
 
-## Trade-close email notifications
+## Email notifications
 
-Optional. When a pair trade fully closes (both legs), the app can email a
-plain-text summary — side, entry/exit spread, per-leg entry/exit mid price,
-duration, and an estimated P&L — via iCloud Mail, so it shows up on your
-phone through the stock Mail app with no extra software needed. Sending is
-best-effort: a failed or unconfigured email never affects trading itself,
-it's purely a notification layered on top (see `oil_pair/notifications.py`).
+Optional. The app emails on a successful open, once both legs of an exit
+have closed, and when startup closes a leg orphaned while the app was down
+(see `oil_pair/notify.py`) — so it shows up on your phone through your
+normal mail app with no extra software needed. Sending is best-effort: a
+failed or unconfigured send is only logged and never affects trading, and
+runs on a background thread so a slow SMTP server can't delay saving state
+for the legs just traded.
 
 To enable it, set in `.env` (see `.env.example`):
 
 ```
-ICLOUD_SMTP_USERNAME=you@icloud.com
-ICLOUD_SMTP_APP_PASSWORD=...
+SMTP_HOST=smtp.mail.me.com
+SMTP_PORT=587
+SMTP_USERNAME=you@icloud.com
+SMTP_PASSWORD=...
+NOTIFY_EMAIL_TO=you@icloud.com
 ```
 
-`ICLOUD_SMTP_APP_PASSWORD` is **not** your Apple ID password — generate a
+For iCloud, `SMTP_PASSWORD` is **not** your Apple ID password — generate a
 dedicated app-specific password at
 [appleid.apple.com](https://appleid.apple.com) under "Sign-In and Security"
-→ "App-Specific Passwords". Notifications go to `ICLOUD_SMTP_USERNAME`
-itself unless `TRADE_NOTIFY_TO` is also set to a different address. Leaving
-both unset disables the feature entirely — nothing changes about how the
-app trades either way.
-
-The summary only covers trades entered and closed within the same process
-run — entry details aren't persisted to `run_state.json`, so a position
-that was already open before a restart (and later closes) won't get an
-email, same as the "no auto-flatten on shutdown" limitation below.
+→ "App-Specific Passwords". Gmail: `smtp.gmail.com`, port 587, with an app
+password. The sender defaults to `SMTP_USERNAME` unless `NOTIFY_EMAIL_FROM`
+is also set. Leaving `SMTP_HOST`/`SMTP_USERNAME`/`SMTP_PASSWORD`/
+`NOTIFY_EMAIL_TO` unset disables the feature entirely — nothing changes
+about how the app trades either way.
 
 ## Manually closing a position
 
@@ -168,21 +188,48 @@ dependency required to run the test suite.
   cache every `poll_interval_seconds` (default 10s) rather than making a
   REST call each iteration. Two ways to read it: `peek_snapshot()` returns
   whatever's cached, however stale, and never raises - used only to check
-  `market_status` (IG pushes a status update when a market closes, e.g. for
-  the weekend, even though prices stop moving); `latest_snapshot()` raises
-  if any epic's last update is older than `max_staleness_seconds` (default
-  60s) - used only once the market is already confirmed tradeable, so a
-  real stream problem during trading hours still fails loudly instead of
-  silently trading on frozen data. Checking tradeability via
-  `latest_snapshot()` directly used to make every weekend close look like a
-  stream failure and trip `MAX_CONSECUTIVE_ERRORS` within minutes.
-- **No historical-data REST call at all.** The initial hedge-ratio fit is
-  seeded from `price_log/<pair_name>/ticks.csv` (built by this app's own
-  past runs) plus freshly streamed prices - see `try_build_initial_model` in
-  `oil_pair/main.py`. This sidesteps IG's historical-data allowance, which
+  `market_status`; `latest_snapshot()` raises if any epic's last update is
+  older than `max_staleness_seconds` (default 60s) - used only once the
+  market is already confirmed tradeable, so a real stream problem during
+  trading hours still fails loudly instead of silently trading on frozen
+  data. Checking tradeability via `latest_snapshot()` directly used to make
+  every weekend close look like a stream failure and trip
+  `MAX_CONSECUTIVE_ERRORS` within minutes.
+- **Prices come from `CHART:<epic>:TICK`, market status from REST.** This
+  used to subscribe to `MARKET:<epic>`, which carried both. As of 2026-09-21
+  IG rejects that item group outright (Lightstreamer error 21, "Invalid
+  group") for every epic, on both demo account types and both session
+  versions, while `CHART:...:TICK` on the same epics streams normally. Only
+  the MARKET group carries `MARKET_STATE`, so status is now re-read over
+  REST every 60s and cached. That status is what tells a closed market apart
+  from a broken stream, so it could not simply be dropped. A failed refresh
+  keeps the last known status rather than reading as "closed".
+- **The subscription itself can also be torn down entirely**, separately
+  from a market just going quiet - observed as `onUnsubscription` +
+  `onSubscriptionError` with no automatic client-side reconnect, which once
+  left a process silently dead for 13 days through several market opens and
+  closes. `PriceStreamer.subscription_is_broken()`/`resubscribe()` exist for
+  this: the main loop polls the former and calls the latter every iteration
+  until it clears, which only happens once a real price arrives - re-issuing
+  the subscribe call is not itself treated as evidence of recovery.
+- **No historical-data REST call at all.** Every fit is seeded from
+  `price_log/<pair_name>/ticks.csv` (built by this app's own past runs) plus
+  freshly streamed prices - see `try_build_initial_model` and `refit_model`
+  in `oil_pair/main.py`. This sidesteps IG's historical-data allowance, which
   is weekly and does not reset on retry (see `oil_pair/ig_client.py`'s
   history around this). Dealing rules and order placement/closing still use
   REST via `IGClient`.
+- **The warmup checks span, not coverage.** `warmup_minutes` compares the
+  oldest and newest point in the window; it does not check for holes between
+  them. `MIN_FIT_OBSERVATIONS` (30, in `strategy_logic.py`) is the only guard
+  on density, and at a 15s poll that is under eight minutes of ticks. A cache
+  holding a handful of points from three weeks ago would therefore satisfy a
+  one-day warmup. In practice the log is written continuously while the app
+  runs, so this only matters after a long outage.
+- **The price log is never pruned.** It only ever grows, and each refit reads
+  the whole file to window the last `max_fit_lookback_days`. At a 15s poll
+  that is roughly 350k rows per month per pair - fine to read every few days,
+  but it will not stay that way indefinitely.
 - **No cross-venue price multiplier.** Both legs trade on IG, so there's no
   need to normalize between a data venue and an execution venue.
 - **No auto-flatten on shutdown.** A clean Ctrl-C / SIGTERM stops the loop

@@ -74,3 +74,94 @@ def test_combines_cached_and_buffered_data(rng):
 
     assert model is not None
     assert model.n_observations == len(cached_a) + len(buffer)
+
+
+def test_waits_a_full_day_when_warmup_is_a_day(rng):
+    """The shipped default: two hours of ticks is plenty of points but is not
+    a day, so there is still no model."""
+    strategy = StrategyConfig(warmup_minutes=1440)
+    now = pd.Timestamp("2026-01-01T12:00:00", tz="UTC")
+    start = now - pd.Timedelta(hours=2)
+    cached_a = _series(rng, 200, start, freq_minutes=0.5, base=100.0)
+    cached_b = _series(rng, 200, start, freq_minutes=0.5, base=50.0)
+
+    assert try_build_initial_model(cached_a, cached_b, [], strategy, "A", "B", now) is None
+
+
+def test_a_days_warmup_is_satisfied_by_a_days_cache(rng):
+    strategy = StrategyConfig(warmup_minutes=1440)
+    now = pd.Timestamp("2026-01-01T12:00:00", tz="UTC")
+    start = now - pd.Timedelta(hours=25)
+    cached_a = _series(rng, 300, start, freq_minutes=5.0, base=100.0)
+    cached_b = _series(rng, 300, start, freq_minutes=5.0, base=50.0)
+
+    assert try_build_initial_model(cached_a, cached_b, [], strategy, "A", "B", now) is not None
+
+
+def test_a_restart_against_a_month_of_cache_fits_immediately(rng):
+    """The point of keeping the cache: a restart does not re-serve the warmup."""
+    strategy = StrategyConfig(warmup_minutes=1440, max_fit_lookback_days=30)
+    now = pd.Timestamp("2026-02-01T12:00:00", tz="UTC")
+    cached_a = _series(rng, 1000, now - pd.Timedelta(days=29), freq_minutes=40.0, base=100.0)
+    cached_b = _series(rng, 1000, now - pd.Timedelta(days=29), freq_minutes=40.0, base=50.0)
+
+    model = try_build_initial_model(cached_a, cached_b, [], strategy, "A", "B", now)
+
+    assert model is not None
+    assert model.n_observations == 1000
+
+
+def test_the_fit_uses_at_most_max_fit_lookback_days(rng):
+    """A cache reaching back six months only contributes its last month."""
+    strategy = StrategyConfig(warmup_minutes=1440, max_fit_lookback_days=30)
+    now = pd.Timestamp("2026-06-01T12:00:00", tz="UTC")
+    # One point an hour for 180 days; only the last 30 days may be fitted.
+    cached_a = _series(rng, 180 * 24, now - pd.Timedelta(days=180), freq_minutes=60.0, base=100.0)
+    cached_b = _series(rng, 180 * 24, now - pd.Timedelta(days=180), freq_minutes=60.0, base=50.0)
+
+    model = try_build_initial_model(cached_a, cached_b, [], strategy, "A", "B", now)
+
+    assert model is not None
+    assert model.n_observations <= 30 * 24 + 1
+    assert model.n_observations > 29 * 24
+
+
+def test_data_entirely_older_than_the_lookback_gives_no_model(rng):
+    """A cache from months ago is not a head start - the window empties it."""
+    strategy = StrategyConfig(warmup_minutes=1440, max_fit_lookback_days=30)
+    now = pd.Timestamp("2026-06-01T12:00:00", tz="UTC")
+    start = now - pd.Timedelta(days=120)
+    cached_a = _series(rng, 500, start, freq_minutes=60.0, base=100.0)
+    cached_b = _series(rng, 500, start, freq_minutes=60.0, base=50.0)
+
+    assert try_build_initial_model(cached_a, cached_b, [], strategy, "A", "B", now) is None
+
+
+def test_fit_window_keeps_only_the_recent_tail(rng):
+    from oil_pair.main import _fit_window
+
+    now = pd.Timestamp("2026-06-01T12:00:00", tz="UTC")
+    series = _series(rng, 100, now - pd.Timedelta(days=50), freq_minutes=60.0 * 12)
+
+    windowed = _fit_window(series, now, lookback_days=30)
+
+    assert len(windowed) < len(series)
+    assert windowed.index.min() >= now - pd.Timedelta(days=30)
+    assert windowed.index.max() == series.index.max()
+
+
+def test_fit_window_passes_an_empty_series_through():
+    from oil_pair.main import _fit_window
+
+    now = pd.Timestamp("2026-06-01T12:00:00", tz="UTC")
+    assert _fit_window(pd.Series(dtype=float), now, 30).empty
+
+
+def test_fit_window_of_zero_days_is_treated_as_no_limit(rng):
+    """Guards against a misconfigured 0 silently throwing away every tick."""
+    from oil_pair.main import _fit_window
+
+    now = pd.Timestamp("2026-06-01T12:00:00", tz="UTC")
+    series = _series(rng, 50, now - pd.Timedelta(days=5), freq_minutes=60.0)
+
+    assert len(_fit_window(series, now, lookback_days=0)) == 50
