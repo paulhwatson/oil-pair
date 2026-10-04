@@ -57,6 +57,10 @@ class InstrumentConfig:
     name: str
     expiry: str
     currency_code: str
+    # Label only, never used for trading: the FMP-era name the same series
+    # is stored under in ../ig-prices (e.g. CLUSD), so the cryptic IG epic
+    # can be matched to it at a glance.
+    fmp_symbol: str | None = None
 
 
 @dataclass(frozen=True)

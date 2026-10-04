@@ -1,11 +1,13 @@
 [instrument_a]
 epic = "CC.D.LCO.USS.IP"
+fmp_symbol = "BZUSD"
 name = "Oil - Brent Crude"
 expiry = "DFB"
 currency_code = "GBP"
 
 [instrument_b]
 epic = "CC.D.CL.USS.IP"
+fmp_symbol = "CLUSD"
 name = "Oil - US Crude"
 expiry = "DFB"
 currency_code = "GBP"
