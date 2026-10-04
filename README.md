@@ -12,6 +12,7 @@ configured pairs:
 
 - `brent_gasoline` — Brent Crude vs. unleaded gasoline
 - `brent_wti` — Brent Crude vs. US Crude (WTI)
+- `wti_heating_oil` — US Crude (WTI) vs. Heating Oil
 
 ## Strategy
 

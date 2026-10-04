@@ -1,0 +1,23 @@
+[instrument_a]
+epic = "CC.D.CL.USS.IP"
+fmp_symbol = "CLUSD"
+name = "Oil - US Crude"
+expiry = "DFB"
+currency_code = "GBP"
+
+[instrument_b]
+epic = "CC.D.HO.USS.IP"
+fmp_symbol = "HOUSD"
+name = "Heating Oil"
+expiry = "DFB"
+currency_code = "GBP"
+
+[strategy]
+notional_trade_size = 3000
+model_update_interval_business_days = 7
+entry_stds = 1.5
+limit_stds = 1.0
+stop_stds = 5.5
+poll_interval_seconds = 15
+warmup_minutes = 1440
+max_fit_lookback_days = 30
