@@ -6,7 +6,10 @@ import pytest
 from oil_pair import notify
 from oil_pair.notify import EmailConfig, Notifier, load_email_config
 
-_ENV_VARS = ("SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD", "NOTIFY_EMAIL_TO", "NOTIFY_EMAIL_FROM")
+_ENV_VARS = (
+    "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
+    "NOTIFY_EMAIL_TO", "NOTIFY_EMAIL_FROM", "NOTIFY_EMAIL_CC",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +39,14 @@ def test_configured_defaults_port_and_sender(monkeypatch):
     config = load_email_config()
     assert config.port == 587
     assert config.sender == "me@example.com"
+    assert config.cc == ()
+
+
+def test_cc_is_a_comma_separated_list(monkeypatch):
+    _configure(monkeypatch)
+    monkeypatch.setenv("NOTIFY_EMAIL_CC", " one@example.com, ,two@example.com ")
+
+    assert load_email_config().cc == ("one@example.com", "two@example.com")
 
 
 class FakeSMTP:
@@ -75,6 +86,21 @@ def test_send_tags_subject_with_pair_name(monkeypatch):
 
     assert [m["Subject"] for m in FakeSMTP.sent] == ["[oil-pair brent_wti] Opened LONG pair"]
     assert FakeSMTP.sent[0]["To"] == "alerts@example.com"
+    assert FakeSMTP.sent[0]["Cc"] is None
+
+
+def test_send_adds_cc_header_when_configured(monkeypatch):
+    FakeSMTP.sent = []
+    monkeypatch.setattr(notify.smtplib, "SMTP", FakeSMTP)
+    config = EmailConfig(
+        host="smtp.example.com", port=587, username="me@example.com", password="secret",
+        sender="me@example.com", recipient="alerts@example.com",
+        cc=("one@example.com", "two@example.com"),
+    )
+
+    Notifier("brent_wti", config)._deliver("Opened LONG pair", "body")
+
+    assert FakeSMTP.sent[0]["Cc"] == "one@example.com, two@example.com"
 
 
 def test_send_is_a_no_op_when_unconfigured(monkeypatch):

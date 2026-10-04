@@ -32,6 +32,11 @@ class EmailConfig:
     password: str
     sender: str
     recipient: str
+    cc: tuple[str, ...] = ()
+
+
+def _parse_addresses(raw: str | None) -> tuple[str, ...]:
+    return tuple(a.strip() for a in (raw or "").split(",") if a.strip())
 
 
 def load_email_config() -> EmailConfig | None:
@@ -51,6 +56,7 @@ def load_email_config() -> EmailConfig | None:
         password=os.environ["SMTP_PASSWORD"],
         sender=os.environ.get("NOTIFY_EMAIL_FROM") or os.environ["SMTP_USERNAME"],
         recipient=os.environ["NOTIFY_EMAIL_TO"],
+        cc=_parse_addresses(os.environ.get("NOTIFY_EMAIL_CC")),
     )
 
 
@@ -70,12 +76,18 @@ class Notifier:
         message["Subject"] = f"[oil-pair {self._pair_name}] {subject}"
         message["From"] = self._config.sender
         message["To"] = self._config.recipient
+        if self._config.cc:
+            # send_message() delivers to Cc recipients too, read from this header.
+            message["Cc"] = ", ".join(self._config.cc)
         message.set_content(body)
         try:
             with smtplib.SMTP(self._config.host, self._config.port, timeout=SMTP_TIMEOUT_SECONDS) as smtp:
                 smtp.starttls()
                 smtp.login(self._config.username, self._config.password)
                 smtp.send_message(message)
-            log.info("emailed %r to %s", subject, self._config.recipient)
+            log.info(
+                "emailed %r to %s%s", subject, self._config.recipient,
+                f" (cc {', '.join(self._config.cc)})" if self._config.cc else "",
+            )
         except Exception:
             log.exception("failed to send email %r", subject)

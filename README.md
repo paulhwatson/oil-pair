@@ -149,7 +149,8 @@ dedicated app-specific password at
 [appleid.apple.com](https://appleid.apple.com) under "Sign-In and Security"
 → "App-Specific Passwords". Gmail: `smtp.gmail.com`, port 587, with an app
 password. The sender defaults to `SMTP_USERNAME` unless `NOTIFY_EMAIL_FROM`
-is also set. Leaving `SMTP_HOST`/`SMTP_USERNAME`/`SMTP_PASSWORD`/
+is also set, and `NOTIFY_EMAIL_CC` (comma-separated) copies every
+notification to additional addresses. Leaving `SMTP_HOST`/`SMTP_USERNAME`/`SMTP_PASSWORD`/
 `NOTIFY_EMAIL_TO` unset disables the feature entirely — nothing changes
 about how the app trades either way.
 
