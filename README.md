@@ -193,8 +193,15 @@ The app deliberately doesn't auto-flatten on shutdown (see below), so if you
 need to close out now rather than wait for the strategy's own exit signal:
 
 ```bash
-./.venv/bin/python scripts/close_positions.py <pair_name>
+./.venv/bin/python scripts/close_positions.py <pair_name>          # demo account
+./.venv/bin/python scripts/close_positions.py <pair_name> --live   # live account
 ```
+
+As with the app, the demo account is used unless `--live` is passed. The
+state file records which account a position was opened on, and the script
+refuses to run against the other one, before logging in to IG. On the wrong
+account every tracked deal would look already closed, and the script would
+reset to FLAT with the real position still open.
 
 This closes exactly the leg(s) recorded in `state/<pair_name>/run_state.json`
 - it will **not** touch any other position that happens to exist on these
@@ -295,6 +302,13 @@ dependency required to run the test suite.
   (`IG_DEMO_*` vs `IG_LIVE_*`, see `.env.example`) - `--live` only ever
   reads `IG_LIVE_*`, so a typo can't point one account's credentials at the
   other.
+- **A position is tied to the account it was opened on.** Demo and live
+  runs of a pair share one `state/<pair_name>/run_state.json`, so it records
+  `account` (`demo`/`live`) at entry. Starting the app, or
+  `scripts/close_positions.py`, on the other account refuses to run
+  (`AccountMismatchError`) rather than finding no deals there and resetting
+  a still-open position to FLAT. Positions saved before this field existed
+  are tagged the first time startup finds both legs open.
 - `.env` (real credentials) and `logs/` are gitignored.
 - If two consecutive-error iterations exceed `MAX_CONSECUTIVE_ERRORS` (10),
   the app exits loudly rather than spinning silently — check the logs.

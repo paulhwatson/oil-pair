@@ -157,3 +157,45 @@ def test_a_rejected_close_of_an_orphaned_leg_stops_startup(monkeypatch, pair_con
 
     with pytest.raises(DealRejectedError):
         reconcile_positions(client, pair_config, state_path)
+
+
+def _on_account(client, acc_type):
+    from types import SimpleNamespace
+
+    client.credentials = SimpleNamespace(acc_type=acc_type)
+    return client
+
+
+def _open_pair(account=None):
+    return RunState(
+        side=PairSide.SHORT, stopped_out=False,
+        leg_a=LegPosition(deal_id="DEAL-A", direction="SELL"),
+        leg_b=LegPosition(deal_id="DEAL-B", direction="BUY"),
+        account=account,
+    )
+
+
+def test_a_live_position_is_not_dropped_by_a_demo_run(monkeypatch, pair_config, state_path):
+    """On demo the live deals aren't listed, so without the check they'd look
+    closed and the pair would reset to FLAT with the live position still open."""
+    from oil_pair.state_store import AccountMismatchError
+
+    monkeypatch.setattr("oil_pair.main.load_state", lambda _: _open_pair(account="live"))
+    client = _on_account(FakeClient(positions_df([])), "demo")
+
+    with pytest.raises(AccountMismatchError):
+        reconcile_positions(client, pair_config, state_path)
+    assert client.close_calls == []
+
+
+def test_a_position_saved_before_accounts_were_recorded_is_tagged_on_resume(monkeypatch, pair_config, state_path):
+    monkeypatch.setattr("oil_pair.main.load_state", lambda _: _open_pair(account=None))
+    client = _on_account(
+        FakeClient(positions_df([["DEAL-A", "SELL", 0.5, "DFB", "EPIC.A"], ["DEAL-B", "BUY", 1.0, "DFB", "EPIC.B"]])),
+        "demo",
+    )
+
+    state = reconcile_positions(client, pair_config, state_path)
+
+    assert state.account == "demo"
+    assert state.leg_a == _open_pair().leg_a

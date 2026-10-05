@@ -14,11 +14,18 @@ of the SAME pair holds the instance lock, since both would read/write the
 same state file concurrently (the exact race that corrupted it once
 already - see instance_lock.py). Other pairs' instances are unaffected.
 
-Usage: close_positions.py <pair_name>
+Uses IG's demo account unless --live is passed, like the app itself. The
+state file records which account a position was opened on, and the script
+refuses to run against the other one: there, every tracked deal would look
+already closed and local state would be reset to FLAT with the real
+position still open.
+
+Usage: close_positions.py <pair_name> [--live]
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from dataclasses import replace
@@ -31,13 +38,21 @@ from oil_pair.ig_client import IGClient, deal_accepted, describe_rejection
 from oil_pair.logging_setup import configure_logging
 from oil_pair.paths import PairPaths, resolve as resolve_paths
 from oil_pair.settings import load_credentials, load_pair_config
-from oil_pair.state_store import LegPosition, RunState, StateCorruptedError, load_state, save_state
+from oil_pair.state_store import (
+    AccountMismatchError,
+    LegPosition,
+    RunState,
+    StateCorruptedError,
+    check_account,
+    load_state,
+    save_state,
+)
 from oil_pair.strategy_logic import PairSide
 
 log = logging.getLogger(__name__)
 
 
-def _close_tracked_positions(paths: PairPaths) -> None:
+def _close_tracked_positions(paths: PairPaths, live: bool = False) -> None:
     try:
         state = load_state(paths.state)
     except StateCorruptedError as exc:
@@ -48,8 +63,19 @@ def _close_tracked_positions(paths: PairPaths) -> None:
         print(f"No tracked open position for {paths.pair_name} - nothing to close.")
         return
 
+    account = "live" if live else "demo"
+    try:
+        check_account(state, account)
+    except AccountMismatchError as exc:
+        print(f"Refusing to run: {exc}")
+        raise SystemExit(1) from exc
+    if state.account is None:
+        print(f"Note: this position was saved before the account was recorded, so it can't be checked - "
+              f"make sure it really is on the {account.upper()} account.")
+
+    print(f"Using the {account.upper()} IG account.")
     pair_config = load_pair_config(paths.pair_config)
-    client = IGClient(load_credentials())
+    client = IGClient(load_credentials(live=live))
     client.login()
 
     open_positions = client.fetch_open_positions()
@@ -90,9 +116,16 @@ def _close_tracked_positions(paths: PairPaths) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit(f"usage: {sys.argv[0]} <pair_name>")
-    paths = resolve_paths(sys.argv[1])
+    parser = argparse.ArgumentParser(
+        description="Close the position this pair's local state tracks. Uses the demo account by default."
+    )
+    parser.add_argument("pair_name", help="matches a directory under config/, e.g. brent_gasoline")
+    parser.add_argument(
+        "--live", action="store_true",
+        help="close on IG's LIVE account (real money, IG_LIVE_* credentials) instead of the default demo account",
+    )
+    args = parser.parse_args()
+    paths = resolve_paths(args.pair_name)
 
     configure_logging(log_dir=paths.log_dir)
 
@@ -103,7 +136,7 @@ def main() -> None:
         raise SystemExit(1) from exc
 
     try:
-        _close_tracked_positions(paths)
+        _close_tracked_positions(paths, live=args.live)
     finally:
         instance_lock.release(paths.instance_lock)
 

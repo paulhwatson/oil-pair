@@ -118,3 +118,43 @@ def test_state_saved_before_entry_details_were_kept_still_loads(tmp_path):
 
     assert loaded.leg_a == LegPosition(deal_id="DEAL-A", direction="SELL")
     assert loaded.leg_a.size is None and loaded.opened_at is None
+
+
+def test_the_account_roundtrips(tmp_path):
+    path = tmp_path / "run_state.json"
+    state = RunState(
+        side=PairSide.SHORT, stopped_out=False,
+        leg_a=LegPosition(deal_id="DEAL-A", direction="SELL"),
+        leg_b=LegPosition(deal_id="DEAL-B", direction="BUY"),
+        account="live",
+    )
+    save_state(state, path)
+
+    assert load_state(path).account == "live"
+
+
+def test_check_account_refuses_a_position_on_the_other_account():
+    from oil_pair.state_store import AccountMismatchError, check_account
+
+    live_position = RunState(
+        side=PairSide.LONG, stopped_out=False,
+        leg_a=LegPosition(deal_id="DEAL-A", direction="BUY"),
+        leg_b=LegPosition(deal_id="DEAL-B", direction="SELL"),
+        account="live",
+    )
+
+    with pytest.raises(AccountMismatchError, match="re-run with --live"):
+        check_account(live_position, "demo")
+    check_account(live_position, "live")  # same account: fine
+
+
+def test_check_account_lets_through_what_it_cannot_judge():
+    from oil_pair.state_store import check_account
+
+    check_account(RunState(side=PairSide.FLAT, stopped_out=False, account="live"), "demo")  # nothing open
+    legacy = RunState(
+        side=PairSide.SHORT, stopped_out=False,
+        leg_a=LegPosition(deal_id="DEAL-A", direction="SELL"),
+        leg_b=LegPosition(deal_id="DEAL-B", direction="BUY"),
+    )
+    check_account(legacy, "live")  # saved before the account was recorded

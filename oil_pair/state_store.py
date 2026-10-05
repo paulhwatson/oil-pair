@@ -56,6 +56,29 @@ class RunState:
     opened_at: pd.Timestamp | None = None
     entry_spread: float | None = None
     entry_std_spread: float | None = None
+    # Which IG account ("demo" or "live") holds the legs. The state file is
+    # shared by both modes, so without this a run on the wrong account looks
+    # for the deals there, finds nothing, and resets to FLAT - abandoning a
+    # real open position. None on state saved before this was recorded.
+    account: str | None = None
+
+
+class AccountMismatchError(Exception):
+    """The saved position is on the other IG account from this run's."""
+
+
+def check_account(state: RunState, account: str) -> None:
+    """Raises AccountMismatchError if `state` holds a position opened on an
+    account other than `account`. FLAT state, and open state saved before
+    the account was recorded, pass - there's nothing to tell them apart by."""
+    if state.side is PairSide.FLAT or state.account is None or state.account == account:
+        return
+    flag = "with" if state.account == "live" else "without"
+    raise AccountMismatchError(
+        f"the saved {state.side.value} position was opened on the {state.account.upper()} IG account, but this run "
+        f"is using {account.upper()}. Looking for its deals here would find nothing and abandon it - re-run "
+        f"{flag} --live to manage it."
+    )
 
 
 def save_state(state: RunState, path: Path = DEFAULT_STATE_PATH) -> None:
@@ -67,6 +90,7 @@ def save_state(state: RunState, path: Path = DEFAULT_STATE_PATH) -> None:
         "opened_at": state.opened_at.isoformat() if state.opened_at is not None else None,
         "entry_spread": state.entry_spread,
         "entry_std_spread": state.entry_std_spread,
+        "account": state.account,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     # Per-process-unique tmp name: two processes both writing state (which
@@ -97,6 +121,7 @@ def load_state(path: Path = DEFAULT_STATE_PATH) -> RunState | None:
             opened_at=pd.Timestamp(data["opened_at"]) if data.get("opened_at") else None,
             entry_spread=data.get("entry_spread"),
             entry_std_spread=data.get("entry_std_spread"),
+            account=data.get("account"),
         )
     except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
         raise StateCorruptedError(

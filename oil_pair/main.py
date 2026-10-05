@@ -21,7 +21,15 @@ from oil_pair.notify import Notifier, load_email_config
 from oil_pair.paths import PairPaths, resolve as resolve_paths
 from oil_pair.price_streamer import PriceStreamer
 from oil_pair.settings import InstrumentConfig, PairConfig, StrategyConfig, load_credentials, load_pair_config
-from oil_pair.state_store import LegPosition, RunState, StateCorruptedError, load_state, save_state
+from oil_pair.state_store import (
+    AccountMismatchError,
+    LegPosition,
+    RunState,
+    StateCorruptedError,
+    check_account,
+    load_state,
+    save_state,
+)
 from oil_pair.strategy_logic import (
     MIN_FIT_OBSERVATIONS,
     Action,
@@ -65,6 +73,12 @@ def reconcile_positions(
     if saved.side is PairSide.FLAT:
         return saved
 
+    # Before asking IG anything: on the wrong account the deals would look
+    # closed and the position would be dropped while still open elsewhere.
+    account = _account(client)
+    if account is not None:
+        check_account(saved, account)
+
     open_positions = client.fetch_open_positions()
     open_deal_ids = set(open_positions["dealId"]) if len(open_positions) else set()
 
@@ -73,6 +87,10 @@ def reconcile_positions(
 
     if a_open and b_open:
         log.info("resuming tracked pair position: side=%s", saved.side)
+        if saved.account is None and account is not None:
+            # Saved before the account was recorded; both deals are on this
+            # account, so that's where the position lives.
+            return replace(saved, account=account)
         return saved
 
     if a_open or b_open:
@@ -258,6 +276,12 @@ def _notify(notifier: Notifier | None, build) -> None:
     notifier.send(subject, body)
 
 
+def _account(client) -> str | None:
+    """"demo" or "live" - the account `client` deals on. None for a client
+    without credentials (the test fakes), which skips the account checks."""
+    return getattr(getattr(client, "credentials", None), "acc_type", None)
+
+
 def _ig_position_size(client: IGClient, deal_id: str) -> float | None:
     """The size IG holds for a deal, or None if it can't be read or isn't listed."""
     try:
@@ -405,6 +429,7 @@ def apply_decision(
         leg_b = leg_i2 if epic_i1 == pair_config.instrument_a.epic else leg_i1
         new_state = RunState(
             side=decision.side, stopped_out=decision.stopped_out, leg_a=leg_a, leg_b=leg_b,
+            account=_account(client),
             opened_at=now,
             entry_spread=compute_spread(mids[epic_i1], mids[epic_i2], model.hedge_ratio),
             entry_std_spread=model.std_spread,
@@ -521,7 +546,7 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
 
     try:
         state = reconcile_positions(client, pair_config, paths.state, notifier)
-    except StateCorruptedError as exc:
+    except (StateCorruptedError, AccountMismatchError) as exc:
         log.critical("%s", exc)
         raise SystemExit(1) from exc
     save_state(state, paths.state)

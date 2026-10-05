@@ -389,3 +389,15 @@ def test_a_rejected_first_leg_opens_nothing_else(pair_config, model, rules, mids
 
     assert client.open_calls == ["EPIC.A"]
     assert client.close_calls == []
+
+
+def test_enter_records_which_account_holds_the_position(pair_config, model, rules, mids):
+    from types import SimpleNamespace
+
+    client = FakeClient()
+    client.credentials = SimpleNamespace(acc_type="live")
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    state = apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), pair_config, model, rules, mids)
+
+    assert state.account == "live"
