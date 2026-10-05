@@ -1,0 +1,28 @@
+# fmp_symbol names the ../ig-prices series (softs group); Robusta never had
+# an FMP code, so it follows ig-prices' exchange-root-plus-currency naming.
+# The two markets overlap ~8 hours a day; the app skips iterations whenever
+# either leg isn't TRADEABLE, so it only trades during that overlap.
+
+[instrument_a]
+epic = "CC.D.KC.USS.IP"
+fmp_symbol = "KCUSD"
+name = "Coffee Arabica"
+expiry = "DFB"
+currency_code = "GBP"
+
+[instrument_b]
+epic = "CC.D.LKD.USS.IP"
+fmp_symbol = "LKDUSD"
+name = "Coffee Robusta"
+expiry = "DFB"
+currency_code = "GBP"
+
+[strategy]
+notional_trade_size = 3000
+model_update_interval_business_days = 7
+entry_stds = 2.0
+limit_stds = 0.0
+stop_stds = 5.5
+poll_interval_seconds = 15
+warmup_minutes = 1440
+max_fit_lookback_days = 30

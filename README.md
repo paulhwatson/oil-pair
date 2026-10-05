@@ -13,6 +13,9 @@ configured pairs:
 - `brent_gasoline` — Brent Crude vs. unleaded gasoline
 - `brent_wti` — Brent Crude vs. US Crude (WTI)
 - `wti_heating_oil` — US Crude (WTI) vs. Heating Oil
+- `arabica_robusta` — Coffee Arabica vs. Coffee Robusta (demo; the two
+  markets overlap only ~8 hours a day, and the app trades only while both
+  are open)
 
 ## Strategy
 
