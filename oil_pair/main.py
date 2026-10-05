@@ -120,6 +120,21 @@ def _fit_window(series: pd.Series, now: pd.Timestamp, lookback_days: int) -> pd.
     return series[series.index >= now - pd.Timedelta(days=lookback_days)]
 
 
+def _time_even(series: pd.Series) -> pd.Series:
+    """One price per hour - the last in each - so a fit weighs every hour of
+    its window equally. The price log mixes densities: the live 15s feed adds
+    ~240 prices an hour, hourly backfill adds one, and an outage adds none.
+    Fitting on raw rows let whichever few days were streamed live decide the
+    whole 30-day fit, putting std_spread (and so every threshold) off by ~2x.
+    """
+    if series.empty:
+        return series
+    series = series.copy()
+    # A cache-plus-buffer concat can leave an object index of Timestamps.
+    series.index = pd.DatetimeIndex(series.index)
+    return series.resample("1h").last().dropna()
+
+
 def try_build_initial_model(
     cached_a: pd.Series,
     cached_b: pd.Series,
@@ -140,12 +155,12 @@ def try_build_initial_model(
     fitted on. A cold start waits for the former; a restart against a cache
     that already holds months of ticks fits immediately, on the latter.
     """
-    combined_a = _fit_window(
+    combined_a = _time_even(_fit_window(
         _combined_series(cached_a, [(ts, a) for ts, a, _ in buffer]), now, strategy.max_fit_lookback_days
-    )
-    combined_b = _fit_window(
+    ))
+    combined_b = _time_even(_fit_window(
         _combined_series(cached_b, [(ts, b) for ts, _, b in buffer]), now, strategy.max_fit_lookback_days
-    )
+    ))
 
     if len(combined_a) < MIN_FIT_OBSERVATIONS or len(combined_b) < MIN_FIT_OBSERVATIONS:
         return None
@@ -165,7 +180,7 @@ def try_build_initial_model(
         stop_stds=strategy.stop_stds,
     )
     log.info(
-        "initial fit ready (%.1f h of data within a %d-day window, %d+%d points): "
+        "initial fit ready (%.1f h of data within a %d-day window, %d+%d hourly points): "
         "i1=%s i2=%s hedge_ratio=%.6f std_spread=%.6f",
         span_minutes / 60, strategy.max_fit_lookback_days, len(combined_a), len(combined_b),
         model.i1_key, model.i2_key, model.hedge_ratio, model.std_spread,
@@ -193,16 +208,16 @@ def refit_model(
     mid-position.
     """
     strategy = pair_config.strategy
-    series_a = _fit_window(
+    series_a = _time_even(_fit_window(
         price_log.load_mid_series(epic_a, price_log_path), now, strategy.max_fit_lookback_days
-    )
-    series_b = _fit_window(
+    ))
+    series_b = _time_even(_fit_window(
         price_log.load_mid_series(epic_b, price_log_path), now, strategy.max_fit_lookback_days
-    )
+    ))
 
     if len(series_a) < MIN_FIT_OBSERVATIONS or len(series_b) < MIN_FIT_OBSERVATIONS:
         log.warning(
-            "refit skipped: only %d/%d points in the last %d day(s), need %d each",
+            "refit skipped: only %d/%d hourly points in the last %d day(s), need %d each",
             len(series_a), len(series_b), strategy.max_fit_lookback_days, MIN_FIT_OBSERVATIONS,
         )
         return None

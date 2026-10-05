@@ -49,7 +49,8 @@ def test_refits_from_the_price_log(tmp_path, rng):
 
     assert model is not None
     assert model.i1_key == EPIC_A  # higher mean price
-    assert model.n_observations == 500
+    # 500 ticks 20 minutes apart cover 167 distinct hours - one price per hour is fitted
+    assert model.n_observations == 167
 
 
 def test_the_refit_window_is_capped_at_max_fit_lookback_days(tmp_path, rng):

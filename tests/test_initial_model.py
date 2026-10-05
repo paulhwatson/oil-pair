@@ -46,9 +46,10 @@ def test_returns_none_when_span_too_short_despite_enough_points(rng):
 def test_returns_model_once_points_and_span_thresholds_met(rng):
     strategy = StrategyConfig(warmup_minutes=30, entry_stds=1.5, limit_stds=1.0, stop_stds=3.0)
     now = pd.Timestamp("2026-01-01T12:00:00", tz="UTC")
-    start = now - pd.Timedelta(minutes=40)
-    cached_a = _series(rng, MIN_FIT_OBSERVATIONS + 10, start, freq_minutes=1.0, base=100.0)
-    cached_b = _series(rng, MIN_FIT_OBSERVATIONS + 10, start, freq_minutes=1.0, base=50.0)
+    n = MIN_FIT_OBSERVATIONS + 10  # hourly, since fits sample one price per hour
+    start = now - pd.Timedelta(hours=n)
+    cached_a = _series(rng, n, start, freq_minutes=60.0, base=100.0)
+    cached_b = _series(rng, n, start, freq_minutes=60.0, base=50.0)
 
     model = try_build_initial_model(cached_a, cached_b, [], strategy, "EPIC.A", "EPIC.B", now)
 
@@ -60,13 +61,14 @@ def test_returns_model_once_points_and_span_thresholds_met(rng):
 def test_combines_cached_and_buffered_data(rng):
     strategy = StrategyConfig(warmup_minutes=30)
     now = pd.Timestamp("2026-01-01T12:00:00", tz="UTC")
-    start = now - pd.Timedelta(minutes=40)
-    # cached alone is short of MIN_FIT_OBSERVATIONS
-    cached_a = _series(rng, MIN_FIT_OBSERVATIONS - 10, start, freq_minutes=1.0, base=100.0)
-    cached_b = _series(rng, MIN_FIT_OBSERVATIONS - 10, start, freq_minutes=1.0, base=50.0)
-    # buffer supplies the rest, spanning up to `now`
+    # cached alone is short of MIN_FIT_OBSERVATIONS (hourly points), ending
+    # well before the buffer starts so no hour holds both
+    start = now - pd.Timedelta(hours=36)
+    cached_a = _series(rng, MIN_FIT_OBSERVATIONS - 10, start, freq_minutes=60.0, base=100.0)
+    cached_b = _series(rng, MIN_FIT_OBSERVATIONS - 10, start, freq_minutes=60.0, base=50.0)
+    # buffer supplies the rest, one point an hour up to `now`
     buffer = [
-        (now - pd.Timedelta(minutes=i), 100.0 + i * 0.01, 50.0 + i * 0.01)
+        (now - pd.Timedelta(hours=i), 100.0 + i * 0.01, 50.0 + i * 0.01)
         for i in range(15, 0, -1)
     ]
 
@@ -88,14 +90,26 @@ def test_waits_a_full_day_when_warmup_is_a_day(rng):
     assert try_build_initial_model(cached_a, cached_b, [], strategy, "A", "B", now) is None
 
 
-def test_a_days_warmup_is_satisfied_by_a_days_cache(rng):
+def test_a_days_warmup_is_satisfied_once_there_are_enough_hours(rng):
+    strategy = StrategyConfig(warmup_minutes=1440)
+    now = pd.Timestamp("2026-01-01T12:00:00", tz="UTC")
+    start = now - pd.Timedelta(hours=31)
+    cached_a = _series(rng, 31 * 12, start, freq_minutes=5.0, base=100.0)
+    cached_b = _series(rng, 31 * 12, start, freq_minutes=5.0, base=50.0)
+
+    assert try_build_initial_model(cached_a, cached_b, [], strategy, "A", "B", now) is not None
+
+
+def test_a_dense_day_is_not_enough_without_thirty_hours(rng):
+    """The cost of sampling hourly: a cold start needs MIN_FIT_OBSERVATIONS
+    (30) distinct hours, not just a day's span - however many ticks."""
     strategy = StrategyConfig(warmup_minutes=1440)
     now = pd.Timestamp("2026-01-01T12:00:00", tz="UTC")
     start = now - pd.Timedelta(hours=25)
-    cached_a = _series(rng, 300, start, freq_minutes=5.0, base=100.0)
-    cached_b = _series(rng, 300, start, freq_minutes=5.0, base=50.0)
+    cached_a = _series(rng, 25 * 240, start, freq_minutes=0.25, base=100.0)  # a 15s feed
+    cached_b = _series(rng, 25 * 240, start, freq_minutes=0.25, base=50.0)
 
-    assert try_build_initial_model(cached_a, cached_b, [], strategy, "A", "B", now) is not None
+    assert try_build_initial_model(cached_a, cached_b, [], strategy, "A", "B", now) is None
 
 
 def test_a_restart_against_a_month_of_cache_fits_immediately(rng):
@@ -108,7 +122,8 @@ def test_a_restart_against_a_month_of_cache_fits_immediately(rng):
     model = try_build_initial_model(cached_a, cached_b, [], strategy, "A", "B", now)
 
     assert model is not None
-    assert model.n_observations == 1000
+    # 1000 points 40 minutes apart cover ~667 distinct hours - one per hour is fitted
+    assert 660 <= model.n_observations <= 670
 
 
 def test_the_fit_uses_at_most_max_fit_lookback_days(rng):
@@ -155,6 +170,50 @@ def test_fit_window_passes_an_empty_series_through():
 
     now = pd.Timestamp("2026-06-01T12:00:00", tz="UTC")
     assert _fit_window(pd.Series(dtype=float), now, 30).empty
+
+
+def test_a_dense_burst_of_ticks_does_not_sway_the_fit(rng):
+    """Real incident: two days of live 15s ticks (~240/hour) outweighed 30
+    days of hourly backfill (1/hour) in an unweighted fit, putting std_spread
+    ~2x off in both directions across the live pairs. Fits now take one
+    price per hour, so adding noisy intra-hour ticks - keeping the last tick
+    in each hour unchanged - must not change the model at all."""
+    strategy = StrategyConfig(warmup_minutes=1440, max_fit_lookback_days=30)
+    now = pd.Timestamp("2026-06-01T12:00:00", tz="UTC")
+    hours = pd.date_range(now - pd.Timedelta(days=29), now, freq="1h", inclusive="left")
+    a = pd.Series(100.0 + np.cumsum(rng.normal(0, 0.3, len(hours))), index=hours)
+    b = 0.5 * a + rng.normal(0, 0.2, len(hours))
+
+    # Like the real price log: both legs share the same unique tick timestamps.
+    minutes = pd.to_timedelta(range(1, 59), unit="min")
+
+    def with_burst(series):
+        extra = []
+        for h in series.index[-48:]:
+            extra.append(pd.Series(series[h] + rng.normal(0, 5.0, len(minutes)), index=h + minutes))
+        # each hour's real value lands last within its hour, so hourly sampling keeps it
+        last = series.copy()
+        last.index = last.index + pd.Timedelta(minutes=59)
+        return pd.concat([last, *extra]).sort_index()
+
+    plain = try_build_initial_model(a, b, [], strategy, "A", "B", now)
+    bursty = try_build_initial_model(with_burst(a), with_burst(b), [], strategy, "A", "B", now)
+
+    assert plain is not None and bursty is not None
+    assert bursty.n_observations == plain.n_observations
+    assert bursty.hedge_ratio == pytest.approx(plain.hedge_ratio)
+    assert bursty.std_spread == pytest.approx(plain.std_spread)
+
+
+def test_time_even_keeps_the_last_price_in_each_hour():
+    from oil_pair.main import _time_even
+
+    idx = pd.to_datetime(
+        ["2026-01-01T10:05Z", "2026-01-01T10:55Z", "2026-01-01T11:30Z", "2026-01-01T13:10Z"]
+    )
+    out = _time_even(pd.Series([1.0, 2.0, 3.0, 4.0], index=idx))
+
+    assert list(out.to_numpy()) == [2.0, 3.0, 4.0]  # empty 12:00 hour dropped, not filled
 
 
 def test_fit_window_of_zero_days_is_treated_as_no_limit(rng):

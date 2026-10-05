@@ -49,6 +49,16 @@ used to fit only on an in-memory buffer of ticks since the previous fit — one
 refit interval, about a week — which is less than the lookback they are meant
 to use.
 
+Every fit then samples its window at **one price per hour** (the last in each
+hour), so each hour carries equal weight however densely it was recorded. The
+price log mixes densities — the live 15s feed adds ~240 prices an hour,
+backfill from `../ig-prices` one, an outage none — and fitting raw rows let
+whichever few days were streamed live decide the whole fit, leaving
+`std_spread` (and with it every entry/limit/stop threshold) about 2× off.
+Live entry/exit decisions still run on every 15s price; only the fit is
+hourly. The cost: a cold start needs `MIN_FIT_OBSERVATIONS` (30) distinct
+hours of prices, not just `warmup_minutes` of span.
+
 ## Setup
 
 This app has its own virtual environment (`.venv/`), separate from any other
@@ -224,9 +234,9 @@ dependency required to run the test suite.
 - **The warmup checks span, not coverage.** `warmup_minutes` compares the
   oldest and newest point in the window; it does not check for holes between
   them. `MIN_FIT_OBSERVATIONS` (30, in `strategy_logic.py`) is the only guard
-  on density, and at a 15s poll that is under eight minutes of ticks. A cache
-  holding a handful of points from three weeks ago would therefore satisfy a
-  one-day warmup. In practice the log is written continuously while the app
+  on density, counted in distinct hours since fits sample hourly. A cache
+  holding thirty scattered hours from three weeks ago would therefore satisfy
+  a one-day warmup. In practice the log is written continuously while the app
   runs, so this only matters after a long outage.
 - **The price log is never pruned.** It only ever grows, and each refit reads
   the whole file to window the last `max_fit_lookback_days`. At a 15s poll
