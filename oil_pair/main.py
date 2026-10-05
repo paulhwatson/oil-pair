@@ -14,8 +14,8 @@ from pathlib import Path
 import pandas as pd
 from trading_ig.rest import ApiExceededException, IGException, TokenInvalidException
 
-from oil_pair import instance_lock, price_log
-from oil_pair.ig_client import IGClient
+from oil_pair import instance_lock, price_log, trade_report
+from oil_pair.ig_client import IGClient, deal_accepted, describe_rejection, require_accepted
 from oil_pair.logging_setup import configure_logging
 from oil_pair.notify import Notifier, load_email_config
 from oil_pair.paths import PairPaths, resolve as resolve_paths
@@ -86,7 +86,10 @@ def reconcile_positions(
             instrument.epic, leg.deal_id,
         )
         opposite = "SELL" if leg.direction == "BUY" else "BUY"
-        client.close_market_position(deal_id=leg.deal_id, direction=opposite, size=row["size"], epic=instrument.epic)
+        confirm = client.close_market_position(deal_id=leg.deal_id, direction=opposite, size=row["size"], epic=instrument.epic)
+        # Raising stops the app at startup with the leg still open, which is
+        # the point: carrying on as FLAT would leave it open and untracked.
+        require_accepted(confirm, f"close of orphaned {instrument.epic} leg (deal_id={leg.deal_id})")
         if notifier is not None:
             notifier.send(
                 f"Closed {saved.side.value} pair on startup",
@@ -237,10 +240,107 @@ def direction_for_leg(side: PairSide, is_i1_leg: bool) -> str:
     return "BUY" if is_i1_leg else "SELL"
 
 
-def _spread_summary(model: Model, mids: dict[str, float]) -> str:
-    spread = compute_spread(mids[model.i1_key], mids[model.i2_key], model.hedge_ratio)
-    stds = spread / model.std_spread if model.std_spread else float("nan")
-    return f"spread={spread:.6f} ({stds:.2f} std), hedge_ratio={model.hedge_ratio:.6f}"
+def _notify(notifier: Notifier | None, build) -> None:
+    """Send a trade email built by `build()`, which returns (subject, body).
+
+    Called after IG has already dealt, before the new state is returned to
+    be saved - so a formatting bug raising here would lose track of real
+    positions. It is logged and swallowed instead: a missing email is a
+    nuisance, an untracked position is not.
+    """
+    if notifier is None:
+        return
+    try:
+        subject, body = build()
+    except Exception:
+        log.exception("could not build the trade email - the trade itself is unaffected")
+        return
+    notifier.send(subject, body)
+
+
+def _ig_position_size(client: IGClient, deal_id: str) -> float | None:
+    """The size IG holds for a deal, or None if it can't be read or isn't listed."""
+    try:
+        positions = client.fetch_open_positions()
+    except Exception as exc:
+        log.warning("could not read open positions from IG to size a close (%s)", exc)
+        return None
+    if len(positions) == 0 or "dealId" not in positions or "size" not in positions:
+        return None
+    rows = positions[positions["dealId"] == deal_id]
+    if rows.empty:
+        return None
+    try:
+        return float(rows.iloc[0]["size"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _close_size(
+    client: IGClient, leg: LegPosition, pair_config: PairConfig, instrument: InstrumentConfig,
+    mids: dict[str, float], rules: dict[str, float],
+) -> float:
+    """How much to close: whatever IG holds for this deal.
+
+    This used to be worked out afresh from the current price, which drifts
+    off the size that was opened once the price crosses a rounding boundary:
+    Robusta opened at £0.85/pt near 3,514 becomes £0.86/pt below ~3,509. A
+    bigger close is refused and a smaller one leaves a sliver open, and
+    either way nothing tracks what's left.
+
+    If IG can't be asked, the size recorded at entry is used. The size
+    worked out from the current price is only a last resort, for a leg
+    opened before sizes were recorded. The close is attempted either way:
+    a deal missing from IG's list is left to the failed-close cross-check
+    to decide, so a hiccup in that list can't skip a real close.
+    """
+    held = _ig_position_size(client, leg.deal_id)
+    if held is not None:
+        return held
+    if leg.size is not None:
+        return leg.size
+    return compute_leg_size(pair_config.strategy.notional_trade_size, mids[instrument.epic], rules[instrument.epic])
+
+
+def _confirm_float(confirm: dict | None, key: str) -> float | None:
+    """A number from IG's deal confirmation, or None if it isn't there.
+    Only used for the emails, so a missing or odd field must never raise."""
+    if not isinstance(confirm, dict) or confirm.get(key) is None:
+        return None
+    try:
+        return float(confirm[key])
+    except (TypeError, ValueError):
+        return None
+
+
+def _names(pair_config: PairConfig) -> dict[str, str]:
+    return {
+        pair_config.instrument_a.epic: pair_config.instrument_a.name,
+        pair_config.instrument_b.epic: pair_config.instrument_b.name,
+    }
+
+
+def _leg_fill(leg: LegPosition, instrument: InstrumentConfig) -> trade_report.LegFill:
+    return trade_report.LegFill(
+        name=instrument.name, epic=instrument.epic, direction=leg.direction,
+        size=leg.size, open_level=leg.open_level, deal_id=leg.deal_id,
+    )
+
+
+def _closed_leg_fill(
+    leg: LegPosition | None, instrument: InstrumentConfig, close_confirms: dict[str, dict | None]
+) -> trade_report.LegFill:
+    if leg is None:  # closed on an earlier iteration - its details went with it
+        return trade_report.LegFill(name=instrument.name, epic=instrument.epic, direction="", closed_earlier=True)
+    confirm = close_confirms.get(instrument.epic)
+    close_level = _confirm_float(confirm, "level")
+    profit = _confirm_float(confirm, "profit")
+    from_ig = profit is not None
+    if profit is None:
+        profit = trade_report.leg_profit(leg.direction, leg.size, leg.open_level, close_level)
+    return replace(
+        _leg_fill(leg, instrument), close_level=close_level, profit=profit, profit_from_ig=from_ig
+    )
 
 
 def apply_decision(
@@ -272,10 +372,12 @@ def apply_decision(
         result_i1 = client.open_market_position(
             epic_i1, instruments[epic_i1].expiry, direction_i1, size_i1, instruments[epic_i1].currency_code
         )
+        require_accepted(result_i1, f"open of {epic_i1}")
         try:
             result_i2 = client.open_market_position(
                 epic_i2, instruments[epic_i2].expiry, direction_i2, size_i2, instruments[epic_i2].currency_code
             )
+            require_accepted(result_i2, f"open of {epic_i2}")
         except Exception:
             log.critical(
                 "second leg (%s) failed to open after first leg (%s) succeeded - closing first leg to avoid "
@@ -283,26 +385,41 @@ def apply_decision(
                 epic_i2, epic_i1,
             )
             opposite = "SELL" if direction_i1 == "BUY" else "BUY"
-            client.close_market_position(deal_id=result_i1["dealId"], direction=opposite, size=size_i1, epic=epic_i1)
+            unwind = client.close_market_position(deal_id=result_i1["dealId"], direction=opposite, size=size_i1, epic=epic_i1)
+            if not deal_accepted(unwind):
+                log.critical(
+                    "IG rejected closing the first leg (%s, deal_id=%s, %s) - it is OPEN AND UNTRACKED; close it by hand",
+                    epic_i1, result_i1["dealId"], describe_rejection(unwind),
+                )
             raise
 
         log.info("ENTER %s: %s %s size=%s, %s %s size=%s", decision.side, direction_i1, epic_i1, size_i1, direction_i2, epic_i2, size_i2)
-        if notifier is not None:
-            notifier.send(
-                f"Opened {decision.side.value} pair",
-                f"{decision.reason}\n\n"
-                f"{direction_i1} {size_i1} {instruments[epic_i1].name} ({epic_i1}) at ~{mids[epic_i1]}, deal {result_i1['dealId']}\n"
-                f"{direction_i2} {size_i2} {instruments[epic_i2].name} ({epic_i2}) at ~{mids[epic_i2]}, deal {result_i2['dealId']}\n\n"
-                f"{_spread_summary(model, mids)}",
-            )
-        leg_i1 = LegPosition(deal_id=result_i1["dealId"], direction=direction_i1)
-        leg_i2 = LegPosition(deal_id=result_i2["dealId"], direction=direction_i2)
+        now = pd.Timestamp.now(tz="UTC")
+        leg_i1 = LegPosition(
+            deal_id=result_i1["dealId"], direction=direction_i1, size=size_i1, open_level=_confirm_float(result_i1, "level")
+        )
+        leg_i2 = LegPosition(
+            deal_id=result_i2["dealId"], direction=direction_i2, size=size_i2, open_level=_confirm_float(result_i2, "level")
+        )
         leg_a = leg_i1 if epic_i1 == pair_config.instrument_a.epic else leg_i2
         leg_b = leg_i2 if epic_i1 == pair_config.instrument_a.epic else leg_i1
-        return RunState(side=decision.side, stopped_out=decision.stopped_out, leg_a=leg_a, leg_b=leg_b)
+        new_state = RunState(
+            side=decision.side, stopped_out=decision.stopped_out, leg_a=leg_a, leg_b=leg_b,
+            opened_at=now,
+            entry_spread=compute_spread(mids[epic_i1], mids[epic_i2], model.hedge_ratio),
+            entry_std_spread=model.std_spread,
+        )
+        _notify(notifier, lambda: trade_report.opened(
+            decision.side, decision.reason,
+            [_leg_fill(leg, instrument) for leg, instrument in
+             ((leg_a, pair_config.instrument_a), (leg_b, pair_config.instrument_b))],
+            model, mids, _names(pair_config), now,
+        ))
+        return new_state
 
     # EXIT_TAKE_PROFIT or EXIT_STOP_LOSS
     log.info("%s: closing both legs", decision.action)
+    close_confirms: dict[str, dict | None] = {}  # epic -> IG's deal confirmation, for the email
 
     def _close_leg(leg: LegPosition | None, instrument: InstrumentConfig) -> LegPosition | None:
         """Returns None once the leg is confirmed closed (or if it was
@@ -315,9 +432,14 @@ def apply_decision(
         if leg is None:
             return None
         opposite = "SELL" if leg.direction == "BUY" else "BUY"
-        size = compute_leg_size(pair_config.strategy.notional_trade_size, mids[instrument.epic], rules[instrument.epic])
+        size = _close_size(client, leg, pair_config, instrument, mids, rules)
         try:
-            client.close_market_position(deal_id=leg.deal_id, direction=opposite, size=size, epic=instrument.epic)
+            confirm = client.close_market_position(deal_id=leg.deal_id, direction=opposite, size=size, epic=instrument.epic)
+            # A rejected close still comes back as a normal response, so
+            # without this a refused close was recorded as done and the
+            # position was left open with nothing tracking it.
+            require_accepted(confirm, f"close of {instrument.epic} leg (deal_id={leg.deal_id})")
+            close_confirms[instrument.epic] = confirm
             return None
         except Exception as exc:
             # IG can fail to close a deal_id that's already gone from the
@@ -351,15 +473,14 @@ def apply_decision(
     remaining_leg_b = _close_leg(state.leg_b, pair_config.instrument_b)
 
     if remaining_leg_a is None and remaining_leg_b is None:
-        if notifier is not None:
-            outcome = "take profit" if decision.action is Action.EXIT_TAKE_PROFIT else "stop loss"
-            notifier.send(
-                f"Closed {state.side.value} pair ({outcome})",
-                f"{decision.reason}\n\n"
-                f"Closed both legs: {pair_config.instrument_a.name} at ~{mids[pair_config.instrument_a.epic]}, "
-                f"{pair_config.instrument_b.name} at ~{mids[pair_config.instrument_b.epic]}.\n\n"
-                f"{_spread_summary(model, mids)}",
-            )
+        outcome = "take profit" if decision.action is Action.EXIT_TAKE_PROFIT else "stop loss"
+        _notify(notifier, lambda: trade_report.closed(
+            state.side, outcome, decision.reason,
+            [_closed_leg_fill(leg, instrument, close_confirms)
+             for leg, instrument in ((state.leg_a, pair_config.instrument_a), (state.leg_b, pair_config.instrument_b))],
+            model, mids, _names(pair_config), pd.Timestamp.now(tz="UTC"),
+            opened_at=state.opened_at, entry_spread=state.entry_spread, entry_std_spread=state.entry_std_spread,
+        ))
         return RunState(side=PairSide.FLAT, stopped_out=decision.stopped_out)
     return replace(state, leg_a=remaining_leg_a, leg_b=remaining_leg_b, stopped_out=decision.stopped_out)
 

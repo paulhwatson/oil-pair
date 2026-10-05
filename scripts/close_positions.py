@@ -21,16 +21,17 @@ from __future__ import annotations
 
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from oil_pair import instance_lock
-from oil_pair.ig_client import IGClient
+from oil_pair.ig_client import IGClient, deal_accepted, describe_rejection
 from oil_pair.logging_setup import configure_logging
 from oil_pair.paths import PairPaths, resolve as resolve_paths
 from oil_pair.settings import load_credentials, load_pair_config
-from oil_pair.state_store import RunState, StateCorruptedError, load_state, save_state
+from oil_pair.state_store import LegPosition, RunState, StateCorruptedError, load_state, save_state
 from oil_pair.strategy_logic import PairSide
 
 log = logging.getLogger(__name__)
@@ -54,9 +55,10 @@ def _close_tracked_positions(paths: PairPaths) -> None:
     open_positions = client.fetch_open_positions()
 
     closed_any = False
-    for epic, leg in (
-        (pair_config.instrument_a.epic, state.leg_a),
-        (pair_config.instrument_b.epic, state.leg_b),
+    refused: dict[str, LegPosition] = {}  # "leg_a"/"leg_b" -> leg IG would not close
+    for key, epic, leg in (
+        ("leg_a", pair_config.instrument_a.epic, state.leg_a),
+        ("leg_b", pair_config.instrument_b.epic, state.leg_b),
     ):
         if leg is None:
             continue
@@ -68,8 +70,20 @@ def _close_tracked_positions(paths: PairPaths) -> None:
         size = matching.iloc[0]["size"]
         opposite = "SELL" if leg.direction == "BUY" else "BUY"
         print(f"Closing {epic} deal_id={leg.deal_id} direction={leg.direction} size={size}...")
-        client.close_market_position(deal_id=leg.deal_id, direction=opposite, size=size, epic=epic)
+        confirm = client.close_market_position(deal_id=leg.deal_id, direction=opposite, size=size, epic=epic)
+        # A refused close comes back as a normal response - see DealRejectedError.
+        if not deal_accepted(confirm):
+            print(f"IG REFUSED to close {epic} deal_id={leg.deal_id}: {describe_rejection(confirm)} - still open.")
+            refused[key] = leg
+            continue
         closed_any = True
+
+    if refused:
+        # Keep tracking what IG would not close, so a re-run (or the app) can still find it.
+        save_state(replace(state, leg_a=refused.get("leg_a"), leg_b=refused.get("leg_b")), paths.state)
+        print("Not done - the refused leg(s) are still open and still tracked in the local state. Re-run once "
+              "the market is open, or close them on IG directly.")
+        raise SystemExit(1)
 
     save_state(RunState(side=PairSide.FLAT, stopped_out=False), paths.state)
     print("Done - local state reset to FLAT." if closed_any else "Nothing needed closing - local state reset to FLAT.")

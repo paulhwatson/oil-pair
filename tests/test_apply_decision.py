@@ -47,8 +47,22 @@ def mids():
 
 
 class FakeClient:
-    def __init__(self, fail_epics: set[str] = frozenset(), open_deal_ids: set[str] | None = None):
+    def __init__(
+        self,
+        fail_epics: set[str] = frozenset(),
+        open_deal_ids: set[str] | None = None,
+        confirms: dict[str, dict] | None = None,
+        held_sizes: dict[str, float] | None = None,
+        rejected: set[str] = frozenset(),
+    ):
         self._fail_epics = fail_epics
+        # deal_id -> size IG holds; when given, it is what fetch_open_positions lists
+        self._held_sizes = held_sizes
+        # epics whose deals IG answers normally but refuses (dealStatus REJECTED)
+        self._rejected = rejected
+        self.close_sizes = {}
+        # epic -> extra fields IG's deal confirmation carries (level, profit)
+        self._confirms = confirms or {}
         # None means "can't confirm either way" (fetch_open_positions raises),
         # matching the old behavior of always retaining a leg whose close
         # failed. Tests that care about the reconciliation-against-IG path
@@ -61,14 +75,22 @@ class FakeClient:
         self.open_calls.append(epic)
         if epic in self._fail_epics:
             raise RuntimeError(f"simulated failure opening {epic}")
-        return {"dealId": f"DEAL-{epic}"}
+        if epic in self._rejected:
+            return {"dealId": f"DEAL-{epic}", "dealStatus": "REJECTED", "reason": "MARKET_CLOSED_WITH_EDITS"}
+        return {"dealId": f"DEAL-{epic}", **self._confirms.get(epic, {})}
 
     def close_market_position(self, deal_id, direction, size, epic=None):
         self.close_calls.append(epic)
         if epic in self._fail_epics:
             raise RuntimeError(f"simulated IG error closing {epic}")
+        self.close_sizes[epic] = size
+        if epic in self._rejected:
+            return {"dealId": deal_id, "dealStatus": "REJECTED", "reason": "POSITION_NOT_AVAILABLE_TO_CLOSE"}
+        return {"dealId": deal_id, **self._confirms.get(epic, {})}
 
     def fetch_open_positions(self):
+        if self._held_sizes is not None:
+            return pd.DataFrame({"dealId": list(self._held_sizes), "size": list(self._held_sizes.values())})
         if self._open_deal_ids is None:
             raise RuntimeError("simulated failure fetching open positions")
         return _positions_df(list(self._open_deal_ids))
@@ -176,9 +198,11 @@ def test_enter_closes_first_leg_and_reraises_when_second_leg_fails_to_open(pair_
 class FakeNotifier:
     def __init__(self):
         self.sent = []
+        self.bodies = []
 
     def send(self, subject, body):
         self.sent.append(subject)
+        self.bodies.append(body)
 
 
 def test_enter_emails_once_when_both_legs_open(pair_config, model, rules, mids):
@@ -188,7 +212,7 @@ def test_enter_emails_once_when_both_legs_open(pair_config, model, rules, mids):
 
     apply_decision(FakeClient(), decision, flat_state, pair_config, model, rules, mids, notifier)
 
-    assert notifier.sent == ["Opened SHORT pair"]
+    assert notifier.sent == ["Opened SHORT pair at +0.00 std"]
 
 
 def test_enter_does_not_email_when_second_leg_fails_to_open(pair_config, model, rules, mids):
@@ -222,3 +246,146 @@ def test_exit_does_not_email_until_the_failed_leg_closes(pair_config, model, rul
 
     apply_decision(FakeClient(), decision, partial, pair_config, model, rules, mids, notifier)
     assert notifier.sent == ["Closed SHORT pair (take profit)"]
+
+
+def test_enter_records_fills_and_entry_details_for_the_close_email(pair_config, model, rules, mids):
+    client = FakeClient(confirms={"EPIC.A": {"level": 100.4}, "EPIC.B": {"level": 49.9}})
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    state = apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), pair_config, model, rules, mids)
+
+    assert state.leg_a == LegPosition(deal_id="DEAL-EPIC.A", direction="SELL", size=10.0, open_level=100.4)
+    assert state.leg_b == LegPosition(deal_id="DEAL-EPIC.B", direction="BUY", size=20.0, open_level=49.9)
+    assert state.opened_at is not None
+    assert state.entry_spread == pytest.approx(0.5 * 100.0 - 50.0)
+    assert state.entry_std_spread == model.std_spread
+
+
+def test_enter_email_carries_levels_and_thresholds(pair_config, model, rules, mids):
+    notifier = FakeNotifier()
+    client = FakeClient(confirms={"EPIC.A": {"level": 100.4}, "EPIC.B": {"level": 49.9}})
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="spread above entry threshold")
+
+    apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), pair_config, model, rules, mids, notifier)
+
+    body = notifier.bodies[0]
+    assert "filled at 100.4" in body and "filled at 49.9" in body
+    assert "Take profit: when the spread falls below +1.00 (+1.00 std)" in body
+    assert "Stop loss: when the spread rises above +3.00 (+3.00 std)" in body
+    assert "Entry band: ±1.50 (1.50 std)" in body
+
+
+def test_exit_email_reports_igs_realised_pnl(pair_config, model, rules, mids):
+    notifier = FakeNotifier()
+    client = FakeClient(confirms={"EPIC.A": {"level": 99.0, "profit": 14.0}, "EPIC.B": {"level": 50.2, "profit": -4.5}})
+    decision = Decision(action=Action.EXIT_TAKE_PROFIT, side=PairSide.FLAT, stopped_out=False, reason="test")
+    state = RunState(
+        side=PairSide.SHORT, stopped_out=False,
+        leg_a=LegPosition(deal_id="DEAL-A", direction="SELL", size=10.0, open_level=100.4),
+        leg_b=LegPosition(deal_id="DEAL-B", direction="BUY", size=20.0, open_level=49.9),
+        opened_at=pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=3), entry_spread=1.6, entry_std_spread=1.0,
+    )
+
+    apply_decision(client, decision, state, pair_config, model, rules, mids, notifier)
+
+    assert notifier.sent == ["Closed SHORT pair (take profit): +£9.50"]
+    assert "Total: +£9.50 (IG's realised P&L)" in notifier.bodies[0]
+    assert "At entry: +1.60" in notifier.bodies[0]
+
+
+def test_a_broken_email_never_costs_the_trade_its_state(pair_config, model, rules, mids, monkeypatch):
+    """The email is built after IG has dealt and before the new state is
+    returned to be saved, so a formatting bug must not lose real positions."""
+    from oil_pair import trade_report
+
+    def boom(*args, **kwargs):
+        raise ValueError("formatting bug")
+
+    monkeypatch.setattr(trade_report, "opened", boom)
+    notifier = FakeNotifier()
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    state = apply_decision(FakeClient(), decision, RunState(side=PairSide.FLAT, stopped_out=False), pair_config, model, rules, mids, notifier)
+
+    assert state.leg_a is not None and state.leg_b is not None
+    assert notifier.sent == []
+
+
+def sized_short_state():
+    return RunState(
+        side=PairSide.SHORT,
+        stopped_out=False,
+        leg_a=LegPosition(deal_id="DEAL-A", direction="SELL", size=10.0, open_level=100.0),
+        leg_b=LegPosition(deal_id="DEAL-B", direction="BUY", size=20.0, open_level=50.0),
+    )
+
+
+def test_close_uses_the_size_ig_holds_not_one_worked_out_from_the_moved_price(pair_config, model, rules):
+    """The real risk: B opened at £20/pt when it was at 50; at 52 the old code
+    worked out 1000/52 = £19.23/pt and would have left £0.77/pt open untracked."""
+    client = FakeClient(held_sizes={"DEAL-A": 10.0, "DEAL-B": 20.0})
+    decision = Decision(action=Action.EXIT_TAKE_PROFIT, side=PairSide.FLAT, stopped_out=False, reason="test")
+
+    result = apply_decision(client, decision, sized_short_state(), pair_config, model, rules, {"EPIC.A": 104.0, "EPIC.B": 52.0})
+
+    assert client.close_sizes == {"EPIC.A": 10.0, "EPIC.B": 20.0}
+    assert result == RunState(side=PairSide.FLAT, stopped_out=False)
+
+
+def test_close_falls_back_to_the_size_recorded_at_entry_when_ig_cant_be_asked(pair_config, model, rules):
+    client = FakeClient(open_deal_ids=None)  # fetch_open_positions raises
+    decision = Decision(action=Action.EXIT_TAKE_PROFIT, side=PairSide.FLAT, stopped_out=False, reason="test")
+
+    apply_decision(client, decision, sized_short_state(), pair_config, model, rules, {"EPIC.A": 104.0, "EPIC.B": 52.0})
+
+    assert client.close_sizes == {"EPIC.A": 10.0, "EPIC.B": 20.0}
+
+
+def test_a_close_still_goes_ahead_when_ig_does_not_list_the_deal(pair_config, model, rules):
+    """IG's list only sizes the close; a deal missing from it is still closed
+    (falling back to the recorded size), so a bad listing can't skip a real close."""
+    client = FakeClient(held_sizes={})
+    decision = Decision(action=Action.EXIT_TAKE_PROFIT, side=PairSide.FLAT, stopped_out=False, reason="test")
+
+    apply_decision(client, decision, sized_short_state(), pair_config, model, rules, {"EPIC.A": 104.0, "EPIC.B": 52.0})
+
+    assert client.close_sizes == {"EPIC.A": 10.0, "EPIC.B": 20.0}
+
+
+def test_a_rejected_close_is_not_taken_as_closed(pair_config, model, rules, mids):
+    notifier = FakeNotifier()
+    client = FakeClient(held_sizes={"DEAL-A": 10.0, "DEAL-B": 20.0}, rejected={"EPIC.A"})
+    decision = Decision(action=Action.EXIT_STOP_LOSS, side=PairSide.FLAT, stopped_out=True, reason="test")
+
+    result = apply_decision(client, decision, sized_short_state(), pair_config, model, rules, mids, notifier)
+
+    assert result.side is PairSide.SHORT
+    assert result.leg_a == sized_short_state().leg_a  # kept, and retried next iteration
+    assert result.leg_b is None
+    assert notifier.sent == []
+
+
+def test_a_rejected_second_leg_unwinds_the_first(pair_config, model, rules, mids):
+    from oil_pair.ig_client import DealRejectedError
+
+    client = FakeClient(rejected={"EPIC.B"})
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    with pytest.raises(DealRejectedError):
+        apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), pair_config, model, rules, mids)
+
+    assert client.open_calls == ["EPIC.A", "EPIC.B"]
+    assert client.close_calls == ["EPIC.A"]
+
+
+def test_a_rejected_first_leg_opens_nothing_else(pair_config, model, rules, mids):
+    from oil_pair.ig_client import DealRejectedError
+
+    client = FakeClient(rejected={"EPIC.A"})
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    with pytest.raises(DealRejectedError):
+        apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), pair_config, model, rules, mids)
+
+    assert client.open_calls == ["EPIC.A"]
+    assert client.close_calls == []

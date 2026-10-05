@@ -133,3 +133,27 @@ def test_resets_to_flat_when_both_tracked_legs_already_closed(monkeypatch, pair_
 
     assert state == RunState(side=PairSide.FLAT, stopped_out=False)
     assert client.close_calls == []
+
+
+def test_a_rejected_close_of_an_orphaned_leg_stops_startup(monkeypatch, pair_config, state_path):
+    """Carrying on FLAT after IG refused the close would leave the leg open
+    and untracked; stopping keeps it in front of the operator."""
+    from oil_pair.ig_client import DealRejectedError
+
+    class RejectingClient(FakeClient):
+        def close_market_position(self, deal_id, direction, size, epic=None):
+            super().close_market_position(deal_id, direction, size, epic)
+            return {"dealId": deal_id, "dealStatus": "REJECTED", "reason": "MARKET_CLOSED_WITH_EDITS"}
+
+    monkeypatch.setattr(
+        "oil_pair.main.load_state",
+        lambda _: RunState(
+            side=PairSide.SHORT, stopped_out=False,
+            leg_a=LegPosition(deal_id="DEAL-A", direction="SELL"),
+            leg_b=LegPosition(deal_id="DEAL-B", direction="BUY"),
+        ),
+    )
+    client = RejectingClient(positions_df([["DEAL-A", "SELL", 0.5, "DFB", "EPIC.A"]]))
+
+    with pytest.raises(DealRejectedError):
+        reconcile_positions(client, pair_config, state_path)

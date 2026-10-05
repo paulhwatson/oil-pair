@@ -84,3 +84,37 @@ def test_concurrent_saves_from_different_pids_do_not_corrupt_each_other(tmp_path
     save_state(RunState(side=PairSide.SHORT, stopped_out=True), path)
 
     assert load_state(path) == RunState(side=PairSide.SHORT, stopped_out=True)
+
+
+def test_save_then_load_roundtrips_entry_details(tmp_path):
+    import pandas as pd
+
+    path = tmp_path / "run_state.json"
+    state = RunState(
+        side=PairSide.LONG,
+        stopped_out=False,
+        leg_a=LegPosition(deal_id="DEAL-A", direction="BUY", size=0.1, open_level=29051.8),
+        leg_b=LegPosition(deal_id="DEAL-B", direction="SELL", size=0.85, open_level=3514.5),
+        opened_at=pd.Timestamp("2026-10-05T12:15:47.48+00:00"),
+        entry_spread=-101.3,
+        entry_std_spread=49.6,
+    )
+    save_state(state, path)
+
+    assert load_state(path) == state
+
+
+def test_state_saved_before_entry_details_were_kept_still_loads(tmp_path):
+    """An open position saved by the previous version must resume, not be
+    treated as corrupt."""
+    path = tmp_path / "run_state.json"
+    path.write_text(
+        '{"side": "SHORT", "stopped_out": false,'
+        ' "leg_a": {"deal_id": "DEAL-A", "direction": "SELL"},'
+        ' "leg_b": {"deal_id": "DEAL-B", "direction": "BUY"}}'
+    )
+
+    loaded = load_state(path)
+
+    assert loaded.leg_a == LegPosition(deal_id="DEAL-A", direction="SELL")
+    assert loaded.leg_a.size is None and loaded.opened_at is None

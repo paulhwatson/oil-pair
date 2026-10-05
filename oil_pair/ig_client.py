@@ -66,6 +66,37 @@ class Snapshot:
     market_status: str
 
 
+class DealRejectedError(Exception):
+    """IG answered a deal request normally but refused the deal itself.
+
+    trading_ig only raises when the request fails; a refused deal comes back
+    as an ordinary confirmation with dealStatus REJECTED. Treating that as
+    done records a position that doesn't exist (open) or forgets one that
+    still does (close).
+    """
+
+
+def deal_accepted(confirm: dict | None) -> bool:
+    """False only when IG says the deal was refused. A confirmation with no
+    dealStatus can't be judged either way and is taken as accepted, as
+    before this check existed."""
+    if not isinstance(confirm, dict):
+        return True
+    status = confirm.get("dealStatus")
+    return status is None or status == "ACCEPTED"
+
+
+def describe_rejection(confirm: dict | None) -> str:
+    if not isinstance(confirm, dict):
+        return "no confirmation"
+    return f"dealStatus={confirm.get('dealStatus')} reason={confirm.get('reason')}"
+
+
+def require_accepted(confirm: dict | None, what: str) -> None:
+    if not deal_accepted(confirm):
+        raise DealRejectedError(f"IG rejected the {what}: {describe_rejection(confirm)}")
+
+
 class IGClient:
     def __init__(self, credentials: IGCredentials):
         self._credentials = credentials

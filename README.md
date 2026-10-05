@@ -147,6 +147,26 @@ failed or unconfigured send is only logged and never affects trading, and
 runs on a background thread so a slow SMTP server can't delay saving state
 for the legs just traded.
 
+Each email is written to be read on a phone (`oil_pair/trade_report.py`):
+
+- **On open:**
+  - each leg's stake, IG fill level, mid price and deal ID;
+  - the spread now, in points and std;
+  - the take-profit and stop levels, how far away each is, and a rough £
+    estimate at each;
+  - the entry band and the model's hedge ratio, std and fit time.
+- **On close:**
+  - each leg's opening and closing levels and IG's realised P&L, plus the
+    total, which also goes in the subject;
+  - how long the pair was held;
+  - the spread at entry and exit, and how far it moved for or against the
+    pair;
+  - the levels in force at exit.
+
+To make the close summary possible, the entry details (stakes, fill levels,
+entry time and spread) are saved in `run_state.json`. Positions saved before
+these fields existed still load, but their close emails show only IG's P&L.
+
 To enable it, set in `.env` (see `.env.example`):
 
 ```
@@ -289,3 +309,19 @@ dependency required to run the test suite.
   `run_state.json` fail to load with `StateCorruptedError`, check IG's
   actual open positions before deciding what to do — don't assume it's safe
   to just delete the file.
+- **A deal IG refuses is treated as a failure, not a success.** IG answers a
+  refused open or close normally, with `dealStatus: REJECTED` in the
+  confirmation, and trading_ig doesn't raise on it. Every open and close
+  checks it (`DealRejectedError` in `oil_pair/ig_client.py`):
+  - A refused second leg unwinds the first.
+  - A refused close keeps the leg tracked, so it is retried on the next
+    iteration.
+  - A refused orphan close at startup stops the app.
+  - `scripts/close_positions.py` keeps any leg IG wouldn't close in the
+    state file.
+- **Closes use the size IG holds**, read from IG's open positions. If IG
+  can't be asked, the size recorded at entry is used instead. A size worked
+  out from the current price drifts off the opened size whenever the price
+  crosses a rounding boundary: Robusta at £0.85/pt becomes £0.86/pt below
+  about 3,509. IG then refuses the close or closes only part of the
+  position.

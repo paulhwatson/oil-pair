@@ -15,6 +15,8 @@ import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import pandas as pd
+
 from oil_pair.strategy_logic import PairSide
 
 log = logging.getLogger(__name__)
@@ -37,6 +39,10 @@ class StateCorruptedError(Exception):
 class LegPosition:
     deal_id: str
     direction: str  # "BUY" or "SELL", as currently held
+    # Recorded at entry for the trade emails only. None on positions opened
+    # before these were tracked, which still load and close as before.
+    size: float | None = None
+    open_level: float | None = None
 
 
 @dataclass(frozen=True)
@@ -45,6 +51,11 @@ class RunState:
     stopped_out: bool
     leg_a: LegPosition | None = None
     leg_b: LegPosition | None = None
+    # Entry details, so the close email can summarise the whole trade. Reset
+    # to None with everything else once the pair is FLAT.
+    opened_at: pd.Timestamp | None = None
+    entry_spread: float | None = None
+    entry_std_spread: float | None = None
 
 
 def save_state(state: RunState, path: Path = DEFAULT_STATE_PATH) -> None:
@@ -53,6 +64,9 @@ def save_state(state: RunState, path: Path = DEFAULT_STATE_PATH) -> None:
         "stopped_out": state.stopped_out,
         "leg_a": asdict(state.leg_a) if state.leg_a else None,
         "leg_b": asdict(state.leg_b) if state.leg_b else None,
+        "opened_at": state.opened_at.isoformat() if state.opened_at is not None else None,
+        "entry_spread": state.entry_spread,
+        "entry_std_spread": state.entry_std_spread,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     # Per-process-unique tmp name: two processes both writing state (which
@@ -80,6 +94,9 @@ def load_state(path: Path = DEFAULT_STATE_PATH) -> RunState | None:
             stopped_out=data["stopped_out"],
             leg_a=LegPosition(**data["leg_a"]) if data.get("leg_a") else None,
             leg_b=LegPosition(**data["leg_b"]) if data.get("leg_b") else None,
+            opened_at=pd.Timestamp(data["opened_at"]) if data.get("opened_at") else None,
+            entry_spread=data.get("entry_spread"),
+            entry_std_spread=data.get("entry_std_spread"),
         )
     except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
         raise StateCorruptedError(
