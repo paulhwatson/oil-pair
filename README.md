@@ -246,6 +246,18 @@ dependency required to run the test suite.
   REST every 60s and cached. That status is what tells a closed market apart
   from a broken stream, so it could not simply be dropped. A failed refresh
   keeps the last known status rather than reading as "closed".
+- **A quiet leg is priced from that same REST call.** `CHART:TICK` only
+  pushes changes, so a leg whose price isn't moving sends nothing at all.
+  The 60s status call also returns the current bid/offer, and that refreshes
+  any leg the stream hasn't updated, at no extra API cost. Before this, a
+  quiet leg aged past `max_staleness_seconds` and every iteration counted as
+  an error. On 2026-10-06, heating oil went untraded for a few minutes after
+  the 23:00 US reopen, and ten errors in a row stopped `wti_heating_oil`
+  while the stream itself was fine. A staleness error now means neither
+  source has produced a price, which is a real fault. Because REST can now
+  stand in for a stream that died without IG saying so, a stream silent on
+  every leg for 15 minutes while all markets are open is logged as a
+  warning.
 - **The subscription itself can also be torn down entirely**, separately
   from a market just going quiet - observed as `onUnsubscription` +
   `onSubscriptionError` with no automatic client-side reconnect, which once

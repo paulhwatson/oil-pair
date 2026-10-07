@@ -14,6 +14,13 @@ carries - market status now comes from a periodic REST snapshot instead (see
 _refresh_market_status_if_due). That status is what tells a closed market
 apart from a broken stream, so it cannot simply be dropped.
 
+The same REST snapshot carries the current bid/offer, which also keeps a
+quiet leg's price fresh: CHART:TICK only pushes changes, so a leg whose
+price isn't moving sends nothing, and without that refresh its cached price
+would age into staleness errors even though the stream is fine. Staleness
+now means neither the stream nor REST has produced a price for a leg -
+a real fault.
+
 Separately, IG can also tear the whole Lightstreamer subscription down (not
 just go quiet on an item) - observed as onUnsubscription + onSubscriptionError
 with no automatic client-side reconnect. subscription_is_broken()/
@@ -49,6 +56,9 @@ DEFAULT_MAX_STALENESS_SECONDS = 60
 # price feed - it only has to notice a close within a minute or so.
 DEFAULT_MARKET_STATUS_REFRESH_SECONDS = 60
 UNKNOWN_STATUS = "UNKNOWN"
+# How long every leg may go without a streamed tick, with all markets open,
+# before it is logged as a possible dead stream (see _warn_if_stream_silent).
+STREAM_SILENCE_WARNING_SECONDS = 15 * 60
 
 
 class PriceStreamer:
@@ -70,6 +80,9 @@ class PriceStreamer:
         self._market_status_checked_at: float | None = None
         self._stream_service: IGStreamService | None = None
         self._subscription_broken = threading.Event()
+        self._started_at: float | None = None
+        self._last_stream_tick_at: float | None = None  # streamed ticks only, never REST
+        self._silence_warned = False
 
     def start(self) -> None:
         self._stream_service = IGStreamService(self._ig_client.service)
@@ -79,6 +92,7 @@ class PriceStreamer:
         self._stream_service.acc_number = self._ig_client.credentials.acc_number
         self._stream_service.create_session(version="2")
         self._stream_service.subscribe(self._build_subscription())
+        self._started_at = time.monotonic()
         log.info("price stream subscribed: %s", self._epics)
 
         # Seed the status cache before the first read, so the loop is not
@@ -134,12 +148,16 @@ class PriceStreamer:
                 mid=(bid + offer) / 2,
                 market_status=self._market_status.get(epic, UNKNOWN_STATUS),
             )
-            self._last_updated_at[epic] = time.monotonic()
+            self._last_updated_at[epic] = self._last_stream_tick_at = time.monotonic()
             self._subscription_broken.clear()
+            resumed = self._silence_warned
+            self._silence_warned = False
+        if resumed:
+            log.info("streamed prices have resumed")
 
     def _refresh_market_status_if_due(self, force: bool = False) -> None:
-        """Re-read each epic's market status over REST, at most every
-        market_status_refresh_seconds.
+        """Re-read each epic's market status - and its current quote - over
+        REST, at most every market_status_refresh_seconds.
 
         Never raises: this runs on the path peek_snapshot() uses, whose whole
         contract is that it does not raise. A failed refresh keeps the last
@@ -153,26 +171,68 @@ class PriceStreamer:
 
         self._market_status_checked_at = now
         for epic in self._epics:
+            requested_at = time.monotonic()
             try:
-                status = self._ig_client.fetch_market(epic)["snapshot"]["marketStatus"]
+                snapshot = self._ig_client.fetch_market(epic)["snapshot"]
+                status = snapshot["marketStatus"]
             except Exception as exc:  # noqa: BLE001 - see docstring
                 log.warning("could not refresh market status for %s: %s", epic, exc)
                 continue
+            bid, offer = _as_price(snapshot.get("bid")), _as_price(snapshot.get("offer"))
 
             with self._lock:
                 previous = self._market_status.get(epic)
                 self._market_status[epic] = status
-                # Republish the cached snapshot so a status change is visible
-                # even when no tick has arrived since - which is exactly the
-                # case at a market close.
                 cached = self._latest.get(epic)
-                if cached is not None and cached.market_status != status:
+                if bid is not None and offer is not None and self._last_updated_at.get(epic, -1.0) < requested_at:
+                    # The quote IG just returned is the current price, so it is
+                    # at least as fresh as anything the stream has sent. This
+                    # matters because CHART:TICK only pushes changes: a leg
+                    # whose price simply isn't moving goes silent, its cached
+                    # price ages past max_staleness, and each iteration used to
+                    # raise - ten in a row stopped wti_heating_oil in the thin
+                    # hour after the 23:00 reopen (2026-10-06) while the stream
+                    # was fine. A tick that lands while this request is in
+                    # flight is newer and is kept. Deliberately does not clear
+                    # subscription_is_broken(): only a real streamed price does.
+                    self._latest[epic] = Snapshot(bid=bid, offer=offer, mid=(bid + offer) / 2, market_status=status)
+                    self._last_updated_at[epic] = time.monotonic()
+                elif cached is not None and cached.market_status != status:
+                    # Republish the cached snapshot so a status change is
+                    # visible even when no tick has arrived since - which is
+                    # exactly the case at a market close.
                     self._latest[epic] = Snapshot(
                         bid=cached.bid, offer=cached.offer, mid=cached.mid, market_status=status
                     )
 
             if previous is not None and previous != status:
                 log.info("market status changed for %s: %s -> %s", epic, previous, status)
+
+        self._warn_if_stream_silent(now)
+
+    def _warn_if_stream_silent(self, now: float) -> None:
+        """Log when no leg has ticked for a long while with every market open.
+
+        With quiet legs refreshed from REST, a stream that died without IG
+        saying so would no longer surface as staleness errors - trading would
+        carry on, on prices up to a refresh interval old. One leg going quiet
+        is normal; every leg silent for this long while all are open is not,
+        so it is logged once per episode (and its end, from _handle_update).
+        """
+        with self._lock:
+            all_open = all(self._market_status.get(epic) == "TRADEABLE" for epic in self._epics)
+            last_tick = self._last_stream_tick_at if self._last_stream_tick_at is not None else self._started_at
+            if last_tick is None or self._silence_warned or not all_open:
+                return
+            silent_for = now - last_tick
+            if silent_for < STREAM_SILENCE_WARNING_SECONDS:
+                return
+            self._silence_warned = True
+        log.warning(
+            "no streamed price on any leg for %.0f min while all markets are open - prices are coming only from "
+            "IG's REST quote every %.0fs until the stream resumes",
+            silent_for / 60, self._market_status_refresh_seconds,
+        )
 
     def wait_for_initial_prices(self, timeout: float = DEFAULT_INITIAL_PRICE_TIMEOUT_SECONDS) -> None:
         deadline = time.monotonic() + timeout
@@ -224,6 +284,16 @@ class PriceStreamer:
         if self._stream_service is not None:
             self._stream_service.disconnect()
             log.info("price stream disconnected")
+
+
+def _as_price(value) -> float | None:
+    """A bid/offer from IG's REST snapshot, which is null while a market is shut."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class _MarketListener(SubscriptionListener):

@@ -31,16 +31,25 @@ from oil_pair.price_streamer import PriceStreamer, _MarketListener
 class FakeIGClient:
     """Serves market status over 'REST', and counts the calls."""
 
-    def __init__(self, statuses=None):
+    def __init__(self, statuses=None, quotes=None):
         self.statuses = statuses or {}
+        # epic -> (bid, offer) the REST snapshot carries; none by default, so
+        # tests that only care about status see no REST prices at all
+        self.quotes = quotes or {}
         self.calls = 0
         self.fail_with: Exception | None = None
+        self.during_request = None  # called mid-request, e.g. to land a streamed tick
 
     def fetch_market(self, epic):
         self.calls += 1
         if self.fail_with is not None:
             raise self.fail_with
-        return {"snapshot": {"marketStatus": self.statuses.get(epic, "TRADEABLE")}}
+        if self.during_request is not None:
+            self.during_request(epic)
+        snapshot = {"marketStatus": self.statuses.get(epic, "TRADEABLE")}
+        if epic in self.quotes:
+            snapshot["bid"], snapshot["offer"] = self.quotes[epic]
+        return {"snapshot": snapshot}
 
 
 class FakeStreamService:
@@ -295,3 +304,119 @@ def test_real_price_update_clears_broken_flag(streamer):
     streamer._handle_update("EPIC.A", 100.0, 101.0)
 
     assert streamer.subscription_is_broken() is False
+
+
+# --- quiet legs are refreshed from the REST quote -------------------------
+
+
+def _quiet_streamer(ig_client, **kwargs):
+    """Refreshes on every read; staleness after 50ms."""
+    return PriceStreamer(ig_client, ["EPIC.A", "EPIC.B"], max_staleness_seconds=0.05,
+                         market_status_refresh_seconds=0, **kwargs)
+
+
+def test_a_quiet_leg_is_not_stale_while_rest_has_a_price():
+    """The 2026-10-06 incident: heating oil sent no ticks for minutes after the
+    23:00 reopen - its price just wasn't moving - and ten staleness errors in
+    a row stopped wti_heating_oil with the stream working fine."""
+    client = FakeIGClient(quotes={"EPIC.A": (100.0, 101.0), "EPIC.B": (45449.0, 45451.0)})
+    streamer = _quiet_streamer(client)
+    streamer._handle_update("EPIC.A", 100.0, 101.0)
+    streamer._handle_update("EPIC.B", 45449.0, 45451.0)
+    time.sleep(0.1)  # both legs silent past max_staleness
+
+    snapshot = streamer.latest_snapshot()  # must not raise
+
+    assert snapshot["EPIC.B"].mid == pytest.approx(45450.0)
+
+
+def test_rest_supplies_the_price_at_its_current_level():
+    client = FakeIGClient(quotes={"EPIC.A": (102.0, 103.0), "EPIC.B": (50.0, 51.0)})
+    streamer = _quiet_streamer(client)
+    streamer._handle_update("EPIC.A", 100.0, 101.0)
+
+    snapshot = streamer.latest_snapshot()
+
+    assert snapshot["EPIC.A"].mid == pytest.approx(102.5)
+    assert snapshot["EPIC.B"].mid == pytest.approx(50.5)  # never ticked, priced from REST
+
+
+def test_still_stale_when_rest_has_no_price_either():
+    """Staleness now means a real fault - neither source has a price - and
+    must still stop the loop from trading on old data."""
+    client = FakeIGClient()
+    streamer = _quiet_streamer(client)
+    streamer._handle_update("EPIC.A", 100.0, 101.0)
+    streamer._handle_update("EPIC.B", 50.0, 51.0)
+    client.fail_with = RuntimeError("REST down")
+    time.sleep(0.1)
+
+    with pytest.raises(RuntimeError, match="no update in over"):
+        streamer.latest_snapshot()
+
+
+def test_a_tick_that_lands_during_the_rest_request_is_kept():
+    client = FakeIGClient(quotes={"EPIC.A": (100.0, 101.0), "EPIC.B": (50.0, 51.0)})
+    streamer = _quiet_streamer(client)
+    client.during_request = lambda epic: streamer._handle_update(epic, 200.0, 201.0)  # newer than the REST quote
+
+    snapshot = streamer.peek_snapshot()
+
+    assert snapshot["EPIC.A"].mid == pytest.approx(200.5)
+    assert snapshot["EPIC.B"].mid == pytest.approx(200.5)
+
+
+def test_a_closed_markets_null_quote_leaves_the_price_alone():
+    client = FakeIGClient(statuses={"EPIC.A": "EDITS_ONLY"}, quotes={"EPIC.A": (None, None)})
+    streamer = PriceStreamer(client, ["EPIC.A"], market_status_refresh_seconds=0)
+    streamer._handle_update("EPIC.A", 100.0, 101.0)
+
+    snapshot = streamer.peek_snapshot()["EPIC.A"]
+
+    assert snapshot.mid == pytest.approx(100.5)
+    assert snapshot.market_status == "EDITS_ONLY"
+
+
+def test_a_rest_price_does_not_count_as_the_stream_recovering():
+    """Only a streamed price proves a torn-down subscription is back."""
+    client = FakeIGClient(quotes={"EPIC.A": (100.0, 101.0), "EPIC.B": (50.0, 51.0)})
+    streamer = _quiet_streamer(client)
+    streamer._mark_subscription_broken()
+
+    streamer.peek_snapshot()
+
+    assert streamer.subscription_is_broken()
+
+
+def test_a_stream_silent_on_every_open_leg_is_logged_once_and_its_return_too(caplog, monkeypatch):
+    import oil_pair.price_streamer as price_streamer
+
+    monkeypatch.setattr(price_streamer, "STREAM_SILENCE_WARNING_SECONDS", 0.05)
+    client = FakeIGClient(quotes={"EPIC.A": (100.0, 101.0), "EPIC.B": (50.0, 51.0)})
+    streamer = _quiet_streamer(client)
+    streamer._started_at = time.monotonic()
+    time.sleep(0.1)
+
+    with caplog.at_level("INFO", logger="oil_pair.price_streamer"):
+        streamer.peek_snapshot()
+        streamer.peek_snapshot()
+        streamer._handle_update("EPIC.A", 100.0, 101.0)
+
+    warnings = [r for r in caplog.records if "no streamed price on any leg" in r.getMessage()]
+    assert len(warnings) == 1
+    assert any("streamed prices have resumed" in r.getMessage() for r in caplog.records)
+
+
+def test_one_closed_leg_is_not_a_silent_stream(caplog, monkeypatch):
+    import oil_pair.price_streamer as price_streamer
+
+    monkeypatch.setattr(price_streamer, "STREAM_SILENCE_WARNING_SECONDS", 0.05)
+    client = FakeIGClient(statuses={"EPIC.A": "TRADEABLE", "EPIC.B": "EDITS_ONLY"})
+    streamer = _quiet_streamer(client)
+    streamer._started_at = time.monotonic()
+    time.sleep(0.1)
+
+    with caplog.at_level("WARNING", logger="oil_pair.price_streamer"):
+        streamer.peek_snapshot()
+
+    assert not any("no streamed price" in r.getMessage() for r in caplog.records)
