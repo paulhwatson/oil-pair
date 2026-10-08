@@ -8,7 +8,7 @@ import argparse
 import logging
 import signal
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pandas as pd
@@ -33,6 +33,7 @@ from oil_pair.state_store import (
 from oil_pair.strategy_logic import (
     MIN_FIT_OBSERVATIONS,
     Action,
+    Decision,
     Model,
     PairSide,
     compute_leg_size,
@@ -258,6 +259,121 @@ def direction_for_leg(side: PairSide, is_i1_leg: bool) -> str:
     return "BUY" if is_i1_leg else "SELL"
 
 
+class EntryFailedError(Exception):
+    """An ENTER could not open both legs. Any leg it did open has been closed
+    again - unless IG refused that too, in which case `left_open` holds its
+    deal_id and it is open and untracked."""
+
+    def __init__(
+        self, failed_epic: str, attempted: dict[str, tuple[str, float]], detail: str, left_open: str | None = None
+    ):
+        super().__init__(f"could not open {failed_epic}: {detail}")
+        self.failed_epic = failed_epic
+        self.attempted = attempted  # epic -> (direction, size)
+        self.detail = detail
+        self.left_open = left_open
+
+
+def _unwind(client: IGClient, epic: str, deal_id: str, direction: str, size: float) -> str | None:
+    """Close a just-opened first leg. Returns its deal_id if it's still open."""
+    opposite = "SELL" if direction == "BUY" else "BUY"
+    try:
+        confirm = client.close_market_position(deal_id=deal_id, direction=opposite, size=size, epic=epic)
+    except Exception as exc:
+        log.critical("closing the first leg (%s, deal_id=%s) failed: %s - it is OPEN AND UNTRACKED; close it by hand",
+                     epic, deal_id, exc)
+        return deal_id
+    if not deal_accepted(confirm):
+        log.critical("IG rejected closing the first leg (%s, deal_id=%s, %s) - it is OPEN AND UNTRACKED; close it by hand",
+                     epic, deal_id, describe_rejection(confirm))
+        return deal_id
+    return None
+
+
+@dataclass
+class EntryGuard:
+    """Paces entries after one fails.
+
+    On 2026-10-08 IG refused brent_gasoline's Brent leg ("MINIMUM_ORDER_SIZE_ERROR"
+    on a size accepted many times before), and the loop retried every 15s:
+    ten opens and closes of the gasoline leg in 2.5 minutes, each paying
+    the spread, before MAX_CONSECUTIVE_ERRORS stopped the pair. Now a failed
+    entry pauses entries for 30 minutes, doubling with each failure in a row
+    up to 8 hours, and the refused leg is opened first on the next attempt.
+    A successful entry resets the pause; exits are never paused.
+    """
+
+    base_wait: pd.Timedelta = pd.Timedelta(minutes=30)
+    max_wait: pd.Timedelta = pd.Timedelta(hours=8)
+    failures: int = 0
+    paused_until: pd.Timestamp | None = None
+    open_first: str | None = None
+
+    def paused(self, now: pd.Timestamp) -> bool:
+        return self.paused_until is not None and now < self.paused_until
+
+    def record_failure(self, failed_epic: str, now: pd.Timestamp) -> pd.Timestamp:
+        self.failures += 1
+        wait = min(self.base_wait * 2 ** (self.failures - 1), self.max_wait)
+        self.paused_until = now + wait
+        self.open_first = failed_epic
+        return self.paused_until
+
+    def record_success(self) -> None:
+        self.failures = 0
+        self.paused_until = None
+
+
+def _market_terms(client: IGClient, epics: list[str]) -> list[str]:
+    """IG's terms for each market right now, for diagnosing a refusal: the
+    minimum deal size it advertises, status and quote. Never raises."""
+    lines = []
+    for epic in epics:
+        try:
+            market = client.fetch_market(epic)
+            rules, snap = market.get("dealingRules") or {}, market.get("snapshot") or {}
+            min_size = (rules.get("minDealSize") or {}).get("value")
+            lines.append(
+                f"{epic}: minDealSize {min_size}, status {snap.get('marketStatus')}, "
+                f"bid/offer {snap.get('bid')}/{snap.get('offer')}, updated {snap.get('updateTime')}"
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            lines.append(f"{epic}: could not read IG's market details ({exc})")
+    return lines
+
+
+def _entry_failure_email(
+    exc: EntryFailedError, side: PairSide, pair_config: PairConfig, terms: list[str], retry_at: pd.Timestamp,
+    failures: int,
+) -> tuple[str, str]:
+    names = _names(pair_config)
+    failed = names.get(exc.failed_epic, exc.failed_epic)
+    lines = [f"IG would not open the {failed} leg of a {side.value} pair: {exc.detail}", ""]
+    for epic, (direction, size) in exc.attempted.items():
+        lines.append(f"Tried: {direction} £{size:.2f}/pt {names.get(epic, epic)} ({epic})")
+    lines.append("")
+    if exc.left_open:
+        lines.append(
+            f"WARNING: the other leg was opened and IG then refused to close it again. It is OPEN AND "
+            f"UNTRACKED (deal {exc.left_open}) - close it on IG by hand."
+        )
+    else:
+        lines.append("Nothing is left open: any leg that did open was closed again.")
+    lines += [
+        "",
+        f"Next attempt no earlier than {trade_report._when(retry_at)} "
+        f"(failure {failures} in a row; the wait doubles each time, up to 8 hours). "
+        f"{failed} will be opened first, so a repeat refusal opens nothing.",
+        "",
+        "IG's terms at the time:",
+        *terms,
+    ]
+    subject = f"Entry refused: {failed} leg"
+    if exc.left_open:
+        subject = f"ACTION NEEDED - {subject}, other leg left open"
+    return subject, "\n".join(lines)
+
+
 def _notify(notifier: Notifier | None, build) -> None:
     """Send a trade email built by `build()`, which returns (subject, body).
 
@@ -376,7 +492,11 @@ def apply_decision(
     rules: dict[str, float],
     mids: dict[str, float],
     notifier: Notifier | None = None,
+    open_first: str | None = None,
 ) -> RunState:
+    """Act on one decision. An ENTER that can't open both legs raises
+    EntryFailedError, having closed again any leg it did open; `open_first`
+    names a leg to open before the other (see EntryGuard)."""
     instruments: dict[str, InstrumentConfig] = {
         pair_config.instrument_a.epic: pair_config.instrument_a,
         pair_config.instrument_b.epic: pair_config.instrument_b,
@@ -393,29 +513,35 @@ def apply_decision(
         direction_i1 = direction_for_leg(decision.side, is_i1_leg=True)
         direction_i2 = direction_for_leg(decision.side, is_i1_leg=False)
 
-        result_i1 = client.open_market_position(
-            epic_i1, instruments[epic_i1].expiry, direction_i1, size_i1, instruments[epic_i1].currency_code
-        )
-        require_accepted(result_i1, f"open of {epic_i1}")
-        try:
-            result_i2 = client.open_market_position(
-                epic_i2, instruments[epic_i2].expiry, direction_i2, size_i2, instruments[epic_i2].currency_code
+        attempted = {epic_i1: (direction_i1, size_i1), epic_i2: (direction_i2, size_i2)}
+        # Normally i1 first. A leg IG has refused before goes first instead:
+        # if it's refused again, nothing has been opened that must be closed.
+        first, second = (epic_i2, epic_i1) if open_first == epic_i2 else (epic_i1, epic_i2)
+
+        def _open(epic: str) -> dict:
+            direction, size = attempted[epic]
+            return client.open_market_position(
+                epic, instruments[epic].expiry, direction, size, instruments[epic].currency_code
             )
-            require_accepted(result_i2, f"open of {epic_i2}")
-        except Exception:
+
+        try:
+            result_first = _open(first)
+            require_accepted(result_first, f"open of {first}")
+        except Exception as exc:
+            raise EntryFailedError(first, attempted, str(exc)) from exc
+        try:
+            result_second = _open(second)
+            require_accepted(result_second, f"open of {second}")
+        except Exception as exc:
             log.critical(
                 "second leg (%s) failed to open after first leg (%s) succeeded - closing first leg to avoid "
                 "an unhedged position",
-                epic_i2, epic_i1,
+                second, first,
             )
-            opposite = "SELL" if direction_i1 == "BUY" else "BUY"
-            unwind = client.close_market_position(deal_id=result_i1["dealId"], direction=opposite, size=size_i1, epic=epic_i1)
-            if not deal_accepted(unwind):
-                log.critical(
-                    "IG rejected closing the first leg (%s, deal_id=%s, %s) - it is OPEN AND UNTRACKED; close it by hand",
-                    epic_i1, result_i1["dealId"], describe_rejection(unwind),
-                )
-            raise
+            left_open = _unwind(client, first, result_first["dealId"], *attempted[first])
+            raise EntryFailedError(second, attempted, str(exc), left_open=left_open) from exc
+        results = {first: result_first, second: result_second}
+        result_i1, result_i2 = results[epic_i1], results[epic_i2]
 
         log.info("ENTER %s: %s %s size=%s, %s %s size=%s", decision.side, direction_i1, epic_i1, size_i1, direction_i2, epic_i2, size_i2)
         now = pd.Timestamp.now(tz="UTC")
@@ -615,6 +741,7 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
     subscription_was_broken = False
 
     consecutive_errors = 0
+    entry_guard = EntryGuard()
     log.info(
         "entering live loop (streamed prices, evaluated every %ds)", pair_config.strategy.poll_interval_seconds
     )
@@ -692,9 +819,32 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
                             next_spread_log_at = now + pd.Timedelta(seconds=SPREAD_LOG_INTERVAL_SECONDS)
 
                         decision = next_decision(spread, model, state.side, state.stopped_out)
+                        if decision.action is Action.ENTER and entry_guard.paused(now):
+                            # Paused after a failed entry; exits are never held back.
+                            decision = Decision(Action.NONE, state.side, state.stopped_out, "entries paused")
                         if decision.action is not Action.NONE:
                             log.info("decision: %s reason=%r spread=%.6f", decision.action, decision.reason, spread)
-                        state = apply_decision(client, decision, state, pair_config, model, rules, mids, notifier)
+                        try:
+                            state = apply_decision(
+                                client, decision, state, pair_config, model, rules, mids, notifier,
+                                open_first=entry_guard.open_first,
+                            )
+                        except EntryFailedError as exc:
+                            # Handled here rather than counted as a loop error: the
+                            # pause is what stops a refusal turning into a retry loop.
+                            retry_at = entry_guard.record_failure(exc.failed_epic, now)
+                            terms = _market_terms(client, [epic_a, epic_b])
+                            log.log(
+                                logging.CRITICAL if exc.left_open else logging.WARNING,
+                                "entry failed (%s) - entries paused until %s; IG's terms now: %s",
+                                exc, retry_at.isoformat(), " | ".join(terms),
+                            )
+                            _notify(notifier, lambda: _entry_failure_email(
+                                exc, decision.side, pair_config, terms, retry_at, entry_guard.failures
+                            ))
+                        else:
+                            if decision.action is Action.ENTER:
+                                entry_guard.record_success()
                         save_state(state, paths.state)
 
                         if now >= next_refit_at:

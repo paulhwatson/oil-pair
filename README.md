@@ -345,6 +345,20 @@ dependency required to run the test suite.
   - A refused orphan close at startup stops the app.
   - `scripts/close_positions.py` keeps any leg IG wouldn't close in the
     state file.
+- **A failed entry pauses entries instead of retrying every iteration.** On
+  2026-10-08 IG refused brent_gasoline's Brent leg at 07:10
+  (`MINIMUM_ORDER_SIZE_ERROR`, on a £0.20/pt stake it had accepted many
+  times). The loop retried every 15s: ten opens and closes of the gasoline
+  leg in 2.5 minutes, each paying the spread, until `MAX_CONSECUTIVE_ERRORS`
+  stopped the pair. Now (`EntryGuard` in `oil_pair/main.py`):
+  - Entries pause for 30 minutes, doubling with each failure in a row up to
+    8 hours. A successful entry resets the pause, and exits are never paused.
+  - The refused leg is opened first next time, so a repeat refusal opens
+    nothing.
+  - IG's terms for both markets at that moment (advertised minimum size,
+    status, quote) are logged and emailed, so the actual rule behind a
+    refusal can be seen.
+  - The email warns loudly if a leg IG refused to close again is left open.
 - **Closes use the size IG holds**, read from IG's open positions. If IG
   can't be asked, the size recorded at entry is used instead. A size worked
   out from the current price drifts off the opened size whenever the price

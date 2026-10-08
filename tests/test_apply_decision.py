@@ -7,7 +7,7 @@ one was gone and the other sat open and unmonitored for a week."""
 import pandas as pd
 import pytest
 
-from oil_pair.main import apply_decision
+from oil_pair.main import EntryFailedError, apply_decision
 from oil_pair.settings import InstrumentConfig, PairConfig, StrategyConfig
 from oil_pair.state_store import LegPosition, RunState
 from oil_pair.strategy_logic import Action, Decision, Model, PairSide
@@ -188,11 +188,13 @@ def test_enter_closes_first_leg_and_reraises_when_second_leg_fails_to_open(pair_
     decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
     flat_state = RunState(side=PairSide.FLAT, stopped_out=False)
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(EntryFailedError) as exc:
         apply_decision(client, decision, flat_state, pair_config, model, rules, mids)
 
     assert client.open_calls == ["EPIC.A", "EPIC.B"]
     assert client.close_calls == ["EPIC.A"]  # corrective close of the leg that DID open
+    assert exc.value.failed_epic == "EPIC.B"
+    assert exc.value.left_open is None
 
 
 class FakeNotifier:
@@ -220,7 +222,7 @@ def test_enter_does_not_email_when_second_leg_fails_to_open(pair_config, model, 
     decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
     flat_state = RunState(side=PairSide.FLAT, stopped_out=False)
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(EntryFailedError):
         apply_decision(FakeClient(fail_epics={"EPIC.B"}), decision, flat_state, pair_config, model, rules, mids, notifier)
 
     assert notifier.sent == []
@@ -371,20 +373,20 @@ def test_a_rejected_second_leg_unwinds_the_first(pair_config, model, rules, mids
     client = FakeClient(rejected={"EPIC.B"})
     decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
 
-    with pytest.raises(DealRejectedError):
+    with pytest.raises(EntryFailedError) as exc:
         apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), pair_config, model, rules, mids)
 
     assert client.open_calls == ["EPIC.A", "EPIC.B"]
     assert client.close_calls == ["EPIC.A"]
+    assert isinstance(exc.value.__cause__, DealRejectedError)
+    assert "MARKET_CLOSED_WITH_EDITS" in exc.value.detail
 
 
 def test_a_rejected_first_leg_opens_nothing_else(pair_config, model, rules, mids):
-    from oil_pair.ig_client import DealRejectedError
-
     client = FakeClient(rejected={"EPIC.A"})
     decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
 
-    with pytest.raises(DealRejectedError):
+    with pytest.raises(EntryFailedError):
         apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), pair_config, model, rules, mids)
 
     assert client.open_calls == ["EPIC.A"]
@@ -401,3 +403,105 @@ def test_enter_records_which_account_holds_the_position(pair_config, model, rule
     state = apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), pair_config, model, rules, mids)
 
     assert state.account == "live"
+
+
+# --- after a refused entry (2026-10-08: ten Brent refusals in 2.5 minutes) ----
+
+
+def test_the_refused_leg_goes_first_so_a_repeat_refusal_opens_nothing(pair_config, model, rules, mids):
+    client = FakeClient(rejected={"EPIC.B"})
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    with pytest.raises(EntryFailedError):
+        apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), pair_config, model, rules,
+                       mids, open_first="EPIC.B")
+
+    assert client.open_calls == ["EPIC.B"]
+    assert client.close_calls == []
+
+
+def test_opening_in_reverse_order_still_records_each_leg_against_its_instrument(pair_config, model, rules, mids):
+    client = FakeClient(confirms={"EPIC.A": {"level": 100.4}, "EPIC.B": {"level": 49.9}})
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    state = apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), pair_config, model,
+                           rules, mids, open_first="EPIC.B")
+
+    assert client.open_calls == ["EPIC.B", "EPIC.A"]
+    assert state.leg_a == LegPosition(deal_id="DEAL-EPIC.A", direction="SELL", size=10.0, open_level=100.4)
+    assert state.leg_b == LegPosition(deal_id="DEAL-EPIC.B", direction="BUY", size=20.0, open_level=49.9)
+
+
+def test_a_first_leg_ig_wont_close_again_is_reported_as_left_open(pair_config, model, rules, mids):
+    class Client(FakeClient):
+        def close_market_position(self, deal_id, direction, size, epic=None):
+            self.close_calls.append(epic)
+            return {"dealId": deal_id, "dealStatus": "REJECTED", "reason": "MARKET_CLOSED_WITH_EDITS"}
+
+    client = Client(rejected={"EPIC.B"})
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    with pytest.raises(EntryFailedError) as exc:
+        apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), pair_config, model, rules, mids)
+
+    assert exc.value.left_open == "DEAL-EPIC.A"
+
+
+def test_entries_pause_for_30_minutes_doubling_to_8_hours_and_reset_on_success():
+    from oil_pair.main import EntryGuard
+
+    guard = EntryGuard()
+    now = pd.Timestamp("2026-10-08T06:10:00Z")
+    assert not guard.paused(now)
+
+    waits = []
+    for _ in range(6):
+        until = guard.record_failure("EPIC.B", now)
+        waits.append(until - now)
+        assert guard.paused(until - pd.Timedelta(seconds=1)) and not guard.paused(until)
+
+    assert waits == [pd.Timedelta(minutes=m) for m in (30, 60, 120, 240, 480, 480)]
+    assert guard.open_first == "EPIC.B"
+
+    guard.record_success()
+    assert not guard.paused(now) and guard.record_failure("EPIC.B", now) - now == pd.Timedelta(minutes=30)
+    assert guard.open_first == "EPIC.B"  # still opened first: harmless, and it was the one refused
+
+
+def test_the_entry_failure_email_says_what_was_tried_what_is_open_and_when_it_retries(pair_config):
+    from oil_pair.main import _entry_failure_email
+
+    exc = EntryFailedError(
+        "EPIC.B", {"EPIC.A": ("BUY", 0.06), "EPIC.B": ("SELL", 0.2)},
+        "IG rejected the open of EPIC.B: dealStatus=REJECTED reason=MINIMUM_ORDER_SIZE_ERROR",
+    )
+    retry_at = pd.Timestamp("2026-10-08T06:40:00Z")
+
+    subject, body = _entry_failure_email(exc, PairSide.LONG, pair_config, ["EPIC.B: minDealSize 0.04"], retry_at, 1)
+
+    assert subject == "Entry refused: B leg"
+    assert "MINIMUM_ORDER_SIZE_ERROR" in body
+    assert "Tried: SELL £0.20/pt B (EPIC.B)" in body
+    assert "Nothing is left open" in body
+    assert "Thu 08 Oct 07:40 UK" in body
+    assert "EPIC.B: minDealSize 0.04" in body
+
+    exc.left_open = "DEAL-A"
+    subject, body = _entry_failure_email(exc, PairSide.LONG, pair_config, [], retry_at, 1)
+    assert subject.startswith("ACTION NEEDED")
+    assert "OPEN AND UNTRACKED (deal DEAL-A)" in body
+
+
+def test_market_terms_never_raise():
+    from oil_pair.main import _market_terms
+
+    class Client:
+        def fetch_market(self, epic):
+            if epic == "BAD":
+                raise RuntimeError("timeout")
+            return {"dealingRules": {"minDealSize": {"value": 0.5}}, "snapshot": {"marketStatus": "TRADEABLE"}}
+
+    lines = _market_terms(Client(), ["GOOD", "BAD"])
+
+    assert lines[0].startswith("GOOD: minDealSize 0.5, status TRADEABLE")
+    assert lines[1] == "BAD: could not read IG's market details (timeout)"
