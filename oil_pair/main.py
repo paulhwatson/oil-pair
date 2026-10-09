@@ -17,7 +17,7 @@ from trading_ig.rest import ApiExceededException, IGException, TokenInvalidExcep
 from oil_pair import instance_lock, price_log, trade_report
 from oil_pair.ig_client import IGClient, deal_accepted, describe_rejection, require_accepted
 from oil_pair.logging_setup import configure_logging
-from oil_pair.notify import Notifier, load_email_config
+from oil_pair.notify import Notifier, load_email_config, load_whatsapp_recipients
 from oil_pair.paths import PairPaths, resolve as resolve_paths
 from oil_pair.price_streamer import PriceStreamer
 from oil_pair.settings import InstrumentConfig, PairConfig, StrategyConfig, load_credentials, load_pair_config
@@ -665,7 +665,7 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
     creds = load_credentials(live=live)
     pair_config = load_pair_config(paths.pair_config)
 
-    notifier = Notifier(paths.pair_name, load_email_config())
+    notifier = Notifier(paths.pair_name, load_email_config(), load_whatsapp_recipients())
 
     client = IGClient(creds)
     client.login()

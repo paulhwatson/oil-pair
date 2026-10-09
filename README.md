@@ -137,7 +137,7 @@ instance lock is a local file, so it only stops two processes on the same
 machine. Never run the same `<pair_name>` on two machines against the same
 IG account at once.
 
-## Email notifications
+## Notifications: email and WhatsApp
 
 Optional. The app emails on a successful open, once both legs of an exit
 have closed, and when startup closes a leg orphaned while the app was down
@@ -186,6 +186,32 @@ is also set, and `NOTIFY_EMAIL_CC` (comma-separated) copies every
 notification to additional addresses. Leaving `SMTP_HOST`/`SMTP_USERNAME`/`SMTP_PASSWORD`/
 `NOTIFY_EMAIL_TO` unset disables the feature entirely — nothing changes
 about how the app trades either way.
+
+### WhatsApp
+
+The same notifications can also go to WhatsApp, through CallMeBot's free
+personal API. Email stays on: WhatsApp is the quick look, email is the record.
+
+1. Each person who wants the alerts adds CallMeBot's number, +34 644 20 47 56
+   (check [their page](https://www.callmebot.com/blog/free-api-whatsapp-messages/)
+   in case it has changed), to their phone contacts.
+2. Each person WhatsApps it "I allow callmebot to send me messages". The
+   reply contains their API key. A key can only message the phone that
+   registered it, so everyone needs their own.
+3. List everyone in `.env`, as comma-separated `+<country code><number>:<apikey>`
+   pairs:
+
+   ```
+   NOTIFY_WHATSAPP=+447700900123:123456,+447700900456:654321
+   ```
+
+4. Check it works with `./.venv/bin/python -m oil_pair.notify`. This sends
+   a test message on every configured channel and logs each result.
+5. Restart the pairs so they pick it up.
+
+CallMeBot is unofficial and best-effort. A failed message is logged and
+never affects trading, the same as a failed email. The API key never
+appears in the logs.
 
 ## Manually closing a position
 

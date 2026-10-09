@@ -5,3 +5,5 @@ scikit-learn
 python-dotenv
 tomli-w
 pytest
+# Already installed with trading-ig; listed because notify.py uses it directly.
+requests
