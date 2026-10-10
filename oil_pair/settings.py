@@ -81,6 +81,45 @@ class StrategyConfig:
     # a price_log that has been accumulating for months doesn't drag an old
     # regime into today's hedge ratio with the same weight as this week.
     max_fit_lookback_days: int = 30
+    # Overrides config/risk.toml's max_loss_per_trade for this pair only.
+    max_loss_per_trade: float | None = None
+
+
+DEFAULT_RISK_CONFIG_PATH = REPO_ROOT / "config" / "risk.toml"
+# Applies when a pair sets max_loss_per_trade but there is no risk.toml.
+DEFAULT_MAX_NOTIONAL_PER_LEG = 10_000.0
+
+
+@dataclass(frozen=True)
+class RiskConfig:
+    """One risk number for every pair (config/risk.toml).
+
+    Each entry is sized so that the spread running from the entry level to
+    the stop loses about max_loss_per_trade - see risk_sized_notional.
+    max_notional_per_leg caps any one leg, because a sharp drop in a pair's
+    fitted std after a refit would otherwise ask for a very large position.
+    """
+
+    max_loss_per_trade: float
+    max_notional_per_leg: float = DEFAULT_MAX_NOTIONAL_PER_LEG
+
+
+def load_risk_config(path: Path = DEFAULT_RISK_CONFIG_PATH) -> RiskConfig | None:
+    """None when there is no risk file: pairs then trade their own fixed
+    notional_trade_size, as before."""
+    if not path.exists():
+        return None
+    with path.open("rb") as f:
+        data = tomllib.load(f)
+    try:
+        config = RiskConfig(**data)
+    except TypeError as exc:
+        raise RuntimeError(f"{path} is malformed: {exc}") from exc
+    for name in ("max_loss_per_trade", "max_notional_per_leg"):
+        value = getattr(config, name)
+        if not isinstance(value, (int, float)) or value <= 0:
+            raise RuntimeError(f"{path}: {name} must be a positive number of pounds, got {value!r}")
+    return config
 
 
 @dataclass(frozen=True)

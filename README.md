@@ -32,6 +32,32 @@ goes straight to live wiring with reasonable default thresholds, per an
 explicit choice made when building it. There is no guarantee Brent Crude and
 gasoline actually form a statistically valid mean-reverting pair.
 
+### Position size: one central risk number
+
+`config/risk.toml` sets `max_loss_per_trade`, one figure for every pair.
+Each new entry is sized from the live model so that a trade running from
+its entry level to its stop loses about that much:
+
+    notional per leg = max_loss_per_trade × price of i2 / ((stop_stds − entry_stds) × std_spread)
+
+Both legs carry that notional. A pair with a calmer spread, or a stop
+closer to its entry, gets a larger position, so a loss at the stop costs
+about the same whichever pair takes it. Before this, each pair had its own
+`notional_trade_size`, and the loss at the stop ranged from about £140 to
+£200.
+
+- **It's approximate.** Dealing costs come on top, a price can jump past the
+  stop between 15-second checks, and a refit mid-trade moves the stop. If
+  the sizing falls below IG's minimum stake, the minimum is used.
+- **There's a cap.** `max_notional_per_leg` caps any one leg, because a
+  sharp drop in a pair's fitted std would otherwise ask for a very large
+  position.
+- **A pair can override it.** Set `max_loss_per_trade` in that pair's
+  `[strategy]` section.
+- **Removing the file brings back the old behaviour:** every pair uses its
+  own `notional_trade_size` again.
+- **Changes need a restart.** Each entry logs how it was sized (`sizing:`).
+
 ### How much data a fit uses
 
 Two settings bound it from opposite ends:

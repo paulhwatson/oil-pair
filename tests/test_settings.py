@@ -73,3 +73,58 @@ def test_missing_demo_vars_raises_with_actionable_message(monkeypatch):
 def test_missing_live_vars_raises_with_actionable_message(monkeypatch):
     with pytest.raises(RuntimeError, match="IG_LIVE_USERNAME"):
         load_credentials(live=True)
+
+
+# --- central risk (config/risk.toml) -----------------------------------------
+
+
+def test_no_risk_file_means_fixed_notionals(tmp_path):
+    from oil_pair.settings import load_risk_config
+
+    assert load_risk_config(tmp_path / "risk.toml") is None
+
+
+def test_risk_file_loads(tmp_path):
+    from oil_pair.settings import RiskConfig, load_risk_config
+
+    path = tmp_path / "risk.toml"
+    path.write_text("max_loss_per_trade = 250\nmax_notional_per_leg = 10000\n")
+
+    assert load_risk_config(path) == RiskConfig(max_loss_per_trade=250, max_notional_per_leg=10000)
+
+
+@pytest.mark.parametrize("body", [
+    "max_loss_per_trade = -5\n",
+    "max_loss_per_trade = 0\n",
+    "max_loss_per_trade = '250'\n",
+    "max_notional_per_leg = 10000\n",  # no max_loss_per_trade
+    "max_loss_per_trade = 250\nmax_los_per_trade = 1\n",  # typo'd extra key
+])
+def test_a_bad_risk_file_is_refused_not_guessed(tmp_path, body):
+    from oil_pair.settings import load_risk_config
+
+    path = tmp_path / "risk.toml"
+    path.write_text(body)
+
+    with pytest.raises(RuntimeError):
+        load_risk_config(path)
+
+
+def test_the_shipped_risk_file_is_valid():
+    from oil_pair.settings import load_risk_config
+
+    risk = load_risk_config()
+    assert risk is not None and risk.max_loss_per_trade > 0 and risk.max_notional_per_leg > 0
+
+
+def test_a_pair_can_override_the_central_risk(tmp_path):
+    from oil_pair.settings import load_pair_config
+
+    path = tmp_path / "pair_config.toml"
+    path.write_text(
+        '[instrument_a]\nepic = "A"\nname = "A"\nexpiry = "DFB"\ncurrency_code = "GBP"\n'
+        '[instrument_b]\nepic = "B"\nname = "B"\nexpiry = "DFB"\ncurrency_code = "GBP"\n'
+        "[strategy]\nmax_loss_per_trade = 100\n"
+    )
+
+    assert load_pair_config(path).strategy.max_loss_per_trade == 100

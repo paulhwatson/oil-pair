@@ -20,7 +20,16 @@ from oil_pair.logging_setup import configure_logging
 from oil_pair.notify import Notifier, load_email_config, load_whatsapp_recipients
 from oil_pair.paths import PairPaths, resolve as resolve_paths
 from oil_pair.price_streamer import PriceStreamer
-from oil_pair.settings import InstrumentConfig, PairConfig, StrategyConfig, load_credentials, load_pair_config
+from oil_pair.settings import (
+    DEFAULT_MAX_NOTIONAL_PER_LEG,
+    InstrumentConfig,
+    PairConfig,
+    RiskConfig,
+    StrategyConfig,
+    load_credentials,
+    load_pair_config,
+    load_risk_config,
+)
 from oil_pair.state_store import (
     AccountMismatchError,
     LegPosition,
@@ -40,6 +49,7 @@ from oil_pair.strategy_logic import (
     compute_spread,
     fit_model,
     next_decision,
+    risk_sized_notional,
 )
 
 log = logging.getLogger(__name__)
@@ -257,6 +267,34 @@ def direction_for_leg(side: PairSide, is_i1_leg: bool) -> str:
     if side is PairSide.SHORT:
         return "SELL" if is_i1_leg else "BUY"
     return "BUY" if is_i1_leg else "SELL"
+
+
+def max_loss_for(strategy: StrategyConfig, risk: RiskConfig | None) -> float | None:
+    """The pair's own override, else the central risk.toml figure, else None
+    (fixed notional_trade_size)."""
+    if strategy.max_loss_per_trade is not None:
+        return strategy.max_loss_per_trade
+    return risk.max_loss_per_trade if risk is not None else None
+
+
+def entry_notional(
+    strategy: StrategyConfig, risk: RiskConfig | None, model: Model, mids: dict[str, float]
+) -> tuple[float, str]:
+    """Notional per leg for a new entry, and a line saying how it was sized."""
+    max_loss = max_loss_for(strategy, risk)
+    if max_loss is None:
+        return strategy.notional_trade_size, f"fixed notional £{strategy.notional_trade_size:,.0f} per leg"
+    cap = risk.max_notional_per_leg if risk is not None else DEFAULT_MAX_NOTIONAL_PER_LEG
+    notional = risk_sized_notional(
+        max_loss, strategy.entry_stds, strategy.stop_stds, model.std_spread, mids[model.i2_key], cap
+    )
+    description = (
+        f"£{notional:,.0f} per leg for about £{max_loss:,.0f} lost at the stop "
+        f"({strategy.stop_stds - strategy.entry_stds:g} std from entry to stop, std {model.std_spread:.2f})"
+    )
+    if notional >= cap:
+        description += f" - capped at max_notional_per_leg £{cap:,.0f}, so less than £{max_loss:,.0f} is at risk"
+    return notional, description
 
 
 class EntryFailedError(Exception):
@@ -493,6 +531,7 @@ def apply_decision(
     mids: dict[str, float],
     notifier: Notifier | None = None,
     open_first: str | None = None,
+    risk: RiskConfig | None = None,
 ) -> RunState:
     """Act on one decision. An ENTER that can't open both legs raises
     EntryFailedError, having closed again any leg it did open; `open_first`
@@ -507,8 +546,10 @@ def apply_decision(
         return replace(state, side=decision.side, stopped_out=decision.stopped_out)
 
     if decision.action is Action.ENTER:
-        size_i1 = compute_leg_size(pair_config.strategy.notional_trade_size, mids[epic_i1], rules[epic_i1])
-        size_i2 = compute_leg_size(pair_config.strategy.notional_trade_size, mids[epic_i2], rules[epic_i2])
+        notional, sizing = entry_notional(pair_config.strategy, risk, model, mids)
+        log.info("sizing: %s", sizing)
+        size_i1 = compute_leg_size(notional, mids[epic_i1], rules[epic_i1])
+        size_i2 = compute_leg_size(notional, mids[epic_i2], rules[epic_i2])
 
         direction_i1 = direction_for_leg(decision.side, is_i1_leg=True)
         direction_i2 = direction_for_leg(decision.side, is_i1_leg=False)
@@ -664,6 +705,19 @@ def run(pair_name: str, live: bool = False) -> None:
 def _run_locked(paths: PairPaths, live: bool = False) -> None:
     creds = load_credentials(live=live)
     pair_config = load_pair_config(paths.pair_config)
+    risk = load_risk_config()
+    max_loss = max_loss_for(pair_config.strategy, risk)
+    if max_loss is None:
+        log.info("sizing: fixed notional £%s per leg (no config/risk.toml)", f"{pair_config.strategy.notional_trade_size:,.0f}")
+    else:
+        if pair_config.strategy.stop_stds <= pair_config.strategy.entry_stds:
+            raise SystemExit(f"risk sizing needs stop_stds above entry_stds in {paths.pair_config}")
+        log.info(
+            "sizing: each entry risks about £%s at its stop (%s), capped at £%s per leg",
+            f"{max_loss:,.0f}",
+            "this pair's override" if pair_config.strategy.max_loss_per_trade is not None else "config/risk.toml",
+            f"{risk.max_notional_per_leg if risk else DEFAULT_MAX_NOTIONAL_PER_LEG:,.0f}",
+        )
 
     notifier = Notifier(paths.pair_name, load_email_config(), load_whatsapp_recipients())
 
@@ -827,7 +881,7 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
                         try:
                             state = apply_decision(
                                 client, decision, state, pair_config, model, rules, mids, notifier,
-                                open_first=entry_guard.open_first,
+                                open_first=entry_guard.open_first, risk=risk,
                             )
                         except EntryFailedError as exc:
                             # Handled here rather than counted as a loop error: the

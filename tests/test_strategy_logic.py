@@ -167,3 +167,31 @@ def test_compute_leg_size_floors_at_minimum_deal_size():
 def test_compute_leg_size_rejects_nonpositive_mid_price():
     with pytest.raises(ValueError):
         compute_leg_size(notional_trade_size=1000, mid_price=0.0, min_deal_size=0.04)
+
+
+# --- risk sizing --------------------------------------------------------------
+
+
+def test_risk_sizing_loses_about_the_target_from_entry_to_stop():
+    from oil_pair.strategy_logic import risk_sized_notional
+
+    # brent_gasoline-like: entry 1.25, stop 5.5, std 247.5, Brent at 10,267
+    notional = risk_sized_notional(250, 1.25, 5.5, 247.5, 10267.0, 10_000)
+
+    size_i2 = notional / 10267.0
+    assert size_i2 * (5.5 - 1.25) * 247.5 == pytest.approx(250)
+
+
+def test_risk_sizing_is_capped():
+    from oil_pair.strategy_logic import risk_sized_notional
+
+    # a refit that collapses the std must not ask for a huge position
+    assert risk_sized_notional(250, 2.0, 4.5, 0.5, 9000.0, 10_000) == 10_000
+
+
+@pytest.mark.parametrize("entry, stop, std", [(2.0, 2.0, 100.0), (3.0, 2.0, 100.0), (2.0, 4.5, 0.0)])
+def test_risk_sizing_refuses_a_stop_not_beyond_entry(entry, stop, std):
+    from oil_pair.strategy_logic import risk_sized_notional
+
+    with pytest.raises(ValueError):
+        risk_sized_notional(250, entry, stop, std, 9000.0, 10_000)

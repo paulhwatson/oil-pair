@@ -505,3 +505,77 @@ def test_market_terms_never_raise():
 
     assert lines[0].startswith("GOOD: minDealSize 0.5, status TRADEABLE")
     assert lines[1] == "BAD: could not read IG's market details (timeout)"
+
+
+# --- central risk sizing ------------------------------------------------------
+
+
+def _risk_pair_config(**strategy):
+    return PairConfig(
+        instrument_a=InstrumentConfig(epic="EPIC.A", name="A", expiry="DFB", currency_code="GBP"),
+        instrument_b=InstrumentConfig(epic="EPIC.B", name="B", expiry="DFB", currency_code="GBP"),
+        strategy=StrategyConfig(notional_trade_size=2000, entry_stds=1.5, stop_stds=3.0, **strategy),
+    )
+
+
+def _sizes(client):
+    return {epic: size for epic, size in client.opened}
+
+
+class SizeRecordingClient(FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.opened = []
+
+    def open_market_position(self, epic, expiry, direction, size, currency_code):
+        self.opened.append((epic, size))
+        return super().open_market_position(epic, expiry, direction, size, currency_code)
+
+
+def test_entry_is_sized_from_the_central_risk(model, rules, mids):
+    """std 1.0, 1.5 std from entry to stop, i2 (EPIC.B) at 50: for £30 at
+    the stop, N = 30 * 50 / 1.5 = £1,000 per leg -> 10/pt on A, 20/pt on B."""
+    from oil_pair.settings import RiskConfig
+
+    client = SizeRecordingClient()
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), _risk_pair_config(),
+                   model, rules, mids, risk=RiskConfig(max_loss_per_trade=30, max_notional_per_leg=10_000))
+
+    assert _sizes(client) == {"EPIC.A": 10.0, "EPIC.B": 20.0}
+
+
+def test_a_pairs_own_risk_overrides_the_central_one(model, rules, mids):
+    from oil_pair.settings import RiskConfig
+
+    client = SizeRecordingClient()
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False),
+                   _risk_pair_config(max_loss_per_trade=15), model, rules, mids,
+                   risk=RiskConfig(max_loss_per_trade=30, max_notional_per_leg=10_000))
+
+    assert _sizes(client) == {"EPIC.A": 5.0, "EPIC.B": 10.0}
+
+
+def test_the_cap_limits_a_risk_sized_entry(model, rules, mids):
+    from oil_pair.settings import RiskConfig
+
+    client = SizeRecordingClient()
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), _risk_pair_config(),
+                   model, rules, mids, risk=RiskConfig(max_loss_per_trade=30, max_notional_per_leg=500))
+
+    assert _sizes(client) == {"EPIC.A": 5.0, "EPIC.B": 10.0}
+
+
+def test_without_a_risk_setting_the_fixed_notional_still_applies(model, rules, mids):
+    client = SizeRecordingClient()
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), _risk_pair_config(),
+                   model, rules, mids)
+
+    assert _sizes(client) == {"EPIC.A": 20.0, "EPIC.B": 40.0}  # the pair's own £2,000 notional_trade_size

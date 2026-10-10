@@ -1,0 +1,22 @@
+# One risk number for every pair.
+#
+# Each new entry is sized from the live model so that if the spread runs from
+# the entry level to the stop, the trade loses about max_loss_per_trade (GBP).
+# Pairs with a tighter stop, or a calmer spread, get a larger position, so a
+# loss at the stop costs about the same whichever pair takes it. See
+# risk_sized_notional in oil_pair/strategy_logic.py.
+#
+# "About": dealing costs come on top, a price can jump past the stop between
+# 15-second checks, and a refit mid-trade moves the stop itself. If the sizing
+# ever falls below IG's minimum stake, the minimum is used and slightly more
+# is at risk.
+#
+# A pair can override max_loss_per_trade in its own [strategy] section. With
+# this file removed, every pair goes back to its own notional_trade_size.
+# Changes take effect when a pair restarts.
+
+max_loss_per_trade = 165
+
+# Safety cap on any one leg's notional. A sharp drop in a pair's fitted std
+# after a refit would otherwise ask for a very large position.
+max_notional_per_leg = 10000

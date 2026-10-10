@@ -142,6 +142,41 @@ def next_decision(
     return Decision(Action.NONE, current_side, stopped_out, "holding long pair position")
 
 
+def risk_sized_notional(
+    max_loss: float,
+    entry_stds: float,
+    stop_stds: float,
+    std_spread: float,
+    price_i2: float,
+    max_notional: float,
+) -> float:
+    """Notional per leg so that a trade running from entry to its stop
+    loses about max_loss, capped at max_notional.
+
+    Both legs carry the same notional N, so the i2 leg is N/price_i2 per
+    point. The spread (hedge_ratio * i1 - i2) is in i2's points, and with
+    equal notionals the pair's P&L moves by about (N/price_i2) per point of
+    spread - exactly so when hedge_ratio equals price_i2/price_i1, and within
+    a few percent at an entry level of a couple of std. A trade enters around
+    entry_stds and is stopped at stop_stds, so the loss at the stop is about
+    (N/price_i2) * (stop_stds - entry_stds) * std_spread. Solving for N:
+
+        N = max_loss * price_i2 / ((stop_stds - entry_stds) * std_spread)
+
+    "About", because dealing costs come on top, a price can jump past the
+    stop between checks, and a refit mid-trade moves the stop itself.
+    """
+    distance = (stop_stds - entry_stds) * std_spread
+    if distance <= 0:
+        raise ValueError(
+            f"risk sizing needs the stop beyond the entry with a positive std "
+            f"(stop {stop_stds} - entry {entry_stds}, std {std_spread})"
+        )
+    if price_i2 <= 0:
+        raise ValueError(f"price_i2 must be positive, got {price_i2}")
+    return min(max_loss * price_i2 / distance, max_notional)
+
+
 def compute_leg_size(
     notional_trade_size: float,
     mid_price: float,
