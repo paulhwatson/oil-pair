@@ -249,6 +249,32 @@ CallMeBot is unofficial and best-effort. A failed message is logged and
 never affects trading, the same as a failed email. The API key never
 appears in the logs.
 
+## Daily news digest
+
+`scripts/news_digest.py` sends a short digest each weekday at 07:00 through
+the same email and WhatsApp notifications. It never trades.
+
+- **Headlines:** the last 24 hours from Google News for every leg of every
+  pair in `config/`, plus OPEC, refinery outages, US oil inventories and USDA
+  crop reports.
+- **Reports due that day,** in UK time: the EIA's weekly oil inventories
+  (Wednesday, moved to Thursday in a US holiday week), USDA's monthly WASDE
+  and the weekly crop progress (Mondays, April–November).
+- **With `ANTHROPIC_API_KEY` in `.env`,** Claude rates each pair OK, WATCH or
+  ACT. WATCH or ACT means news that hits one leg and not the other: an
+  outage, an export ban, a policy change. Without a key, the headlines are
+  sent unscored. The headlines are treated as untrusted data in the prompt.
+- **Scheduling:** `./scripts/install_news_digest.sh install | uninstall |
+  status`. `--dry-run` prints a digest without sending it. The WASDE dates
+  are a list in the script; update it each year from usda.gov.
+
+Why no automatic filter around these reports: a 2026-10-11 test found that
+pair trades opened from an hour before to three hours after a scheduled
+report averaged +£12, against +£77 for other trades, and hit their stop more
+often. They were only 28 of 518 trades, though, and blocking entries in those
+windows changed any pair's monthly result by £6 at most. So the digest just
+names the day's reports.
+
 ## Manually closing a position
 
 The app deliberately doesn't auto-flatten on shutdown (see below), so if you
