@@ -116,3 +116,33 @@ def test_columbus_day_moves_both_crop_progress_and_the_eia_report(nd):
     assert nd.scheduled_today(pd.Timestamp("2026-10-13")) == ["21:00 USDA crop progress - grain pairs"]
     assert nd.scheduled_today(pd.Timestamp("2026-10-14")) == []
     assert nd.scheduled_today(pd.Timestamp("2026-10-15")) == ["16:00 US oil inventories (EIA, holiday-delayed) - oil pairs"]
+
+
+def test_an_answer_that_is_all_thinking_falls_back_and_says_why(nd, monkeypatch, caplog):
+    """The 2026-10-11 failure: the model spent its whole output limit thinking."""
+    class Reply:
+        status_code = 200
+
+        def json(self):
+            return {"stop_reason": "max_tokens", "content": [{"type": "thinking", "thinking": ""}]}
+
+    monkeypatch.setattr(nd.requests, "post", lambda *a, **k: Reply())
+    subject, _ = nd.build(*_inputs(nd), api_key="sk-test", model="m")
+
+    assert subject.endswith("(unscored)")
+    assert "no answer text (stop_reason=max_tokens)" in caplog.text
+
+
+def test_only_the_answer_text_is_used_not_the_thinking(nd, monkeypatch):
+    class Reply:
+        status_code = 200
+
+        def json(self):
+            return {"content": [{"type": "thinking", "thinking": "hmm", "text": "IGNORE"},
+                                {"type": "text", "text": "FLAGS: 0\nbrent_heating_oil: OK - quiet"}]}
+
+    monkeypatch.setattr(nd.requests, "post", lambda *a, **k: Reply())
+    subject, body = nd.build(*_inputs(nd), api_key="sk-test", model="m")
+
+    assert subject == "Daily news: nothing flagged"
+    assert "IGNORE" not in body

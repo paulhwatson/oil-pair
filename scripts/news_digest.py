@@ -50,6 +50,7 @@ RSS_URL = "https://news.google.com/rss/search"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-sonnet-5-5"
 HEADLINES_PER_QUERY = 8
+MAX_TOKENS = 4000  # thinking + answer; the answer itself is ~200 words
 HTTP_TIMEOUT = 20
 
 # What to search for each leg; anything not listed falls back to its name.
@@ -193,13 +194,20 @@ def ask_claude(prompt: str, api_key: str, model: str) -> str | None:
         response = requests.post(
             ANTHROPIC_URL, timeout=60,
             headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": model, "max_tokens": 600, "messages": [{"role": "user", "content": prompt}]},
+            # Room for the model's thinking as well as its answer: Sonnet 5.5
+            # thinks before replying by default, and at 600 tokens it used
+            # them all thinking and returned no answer (2026-10-11).
+            json={"model": model, "max_tokens": MAX_TOKENS, "messages": [{"role": "user", "content": prompt}]},
         )
         if response.status_code != 200:
             log.error("Claude API returned HTTP %s: %s", response.status_code,
                       response.text[:200].replace(api_key, "***"))
             return None
-        return "".join(part.get("text", "") for part in response.json().get("content", [])).strip() or None
+        body = response.json()
+        text = "".join(p.get("text", "") for p in body.get("content", []) if p.get("type") == "text").strip()
+        if not text:
+            log.warning("Claude returned no answer text (stop_reason=%s)", body.get("stop_reason"))
+        return text or None
     except Exception as exc:  # noqa: BLE001
         log.error("Claude API call failed: %s", str(exc).replace(api_key, "***"))
         return None
