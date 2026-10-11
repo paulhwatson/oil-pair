@@ -303,13 +303,55 @@ class EntryFailedError(Exception):
     deal_id and it is open and untracked."""
 
     def __init__(
-        self, failed_epic: str, attempted: dict[str, tuple[str, float]], detail: str, left_open: str | None = None
+        self, failed_epic: str, attempted: dict[str, tuple[str, float]], detail: str, left_open: str | None = None,
+        by_ig: bool = True,
     ):
         super().__init__(f"could not open {failed_epic}: {detail}")
         self.failed_epic = failed_epic
         self.attempted = attempted  # epic -> (direction, size)
         self.detail = detail
         self.left_open = left_open
+        self.by_ig = by_ig  # False when the app itself declined, before sending anything to IG
+
+
+# How far IG's minimum stake may push a trade's risk above the risk setting
+# before the entry is declined rather than traded.
+MAX_MIN_STAKE_UPSCALE = 1.5
+
+
+def _meet_minimum_stakes(
+    notional: float, sizing: str, directions: dict[str, str], rules: dict[str, float], mids: dict[str, float],
+    instruments: dict[str, InstrumentConfig],
+) -> tuple[float, str]:
+    """Raise the notional so every leg meets IG's minimum stake, keeping the
+    legs equal.
+
+    compute_leg_size floors each leg at IG's minimum on its own, so a leg
+    below it used to be rounded up alone - brent_heating_oil at £165 risk
+    wanted £1,440 a leg, which is £0.031/pt of heating oil, and the £0.04
+    minimum would have made that leg £1,861 against Brent's £1,440: 29% out of
+    hedge. Scaling both legs keeps the pair balanced and puts more at risk
+    instead; past MAX_MIN_STAKE_UPSCALE the entry is declined (EntryFailedError,
+    so entries pause and an email says why).
+    """
+    needed = {epic: rules[epic] * mids[epic] for epic in directions}  # notional at which each leg hits its minimum
+    floor_epic = max(needed, key=needed.get)
+    if notional >= needed[floor_epic]:
+        return notional, sizing
+    scale = needed[floor_epic] / notional
+    name = instruments[floor_epic].name
+    if scale > MAX_MIN_STAKE_UPSCALE:
+        attempted = {epic: (direction, round(notional / mids[epic], 4)) for epic, direction in directions.items()}
+        raise EntryFailedError(
+            floor_epic, attempted,
+            f"not opened: IG's minimum stake of £{rules[floor_epic]:g}/pt on {name} needs £{needed[floor_epic]:,.0f} "
+            f"per leg, {scale:.1f}x the £{notional:,.0f} the risk setting allows (limit {MAX_MIN_STAKE_UPSCALE:g}x)",
+            by_ig=False,
+        )
+    return needed[floor_epic], (
+        f"{sizing}; raised to £{needed[floor_epic]:,.0f} per leg ({scale:.2f}x the risk) so {name} meets IG's "
+        f"£{rules[floor_epic]:g}/pt minimum with the legs still equal"
+    )
 
 
 def _unwind(client: IGClient, epic: str, deal_id: str, direction: str, size: float) -> str | None:
@@ -386,7 +428,10 @@ def _entry_failure_email(
 ) -> tuple[str, str]:
     names = _names(pair_config)
     failed = names.get(exc.failed_epic, exc.failed_epic)
-    lines = [f"IG would not open the {failed} leg of a {side.value} pair: {exc.detail}", ""]
+    if exc.by_ig:
+        lines = [f"IG would not open the {failed} leg of a {side.value} pair: {exc.detail}", ""]
+    else:
+        lines = [f"The {side.value} pair was not opened - {exc.detail}.", ""]
     for epic, (direction, size) in exc.attempted.items():
         lines.append(f"Tried: {direction} £{size:.2f}/pt {names.get(epic, epic)} ({epic})")
     lines.append("")
@@ -395,18 +440,20 @@ def _entry_failure_email(
             f"WARNING: the other leg was opened and IG then refused to close it again. It is OPEN AND "
             f"UNTRACKED (deal {exc.left_open}) - close it on IG by hand."
         )
+    elif not exc.by_ig:
+        lines.append("Nothing was sent to IG, so nothing is open.")
     else:
         lines.append("Nothing is left open: any leg that did open was closed again.")
     lines += [
         "",
         f"Next attempt no earlier than {trade_report._when(retry_at)} "
-        f"(failure {failures} in a row; the wait doubles each time, up to 8 hours). "
-        f"{failed} will be opened first, so a repeat refusal opens nothing.",
+        f"(failure {failures} in a row; the wait doubles each time, up to 8 hours)."
+        + (f" {failed} will be opened first, so a repeat refusal opens nothing." if exc.by_ig else ""),
         "",
         "IG's terms at the time:",
         *terms,
     ]
-    subject = f"Entry refused: {failed} leg"
+    subject = f"Entry refused: {failed} leg" if exc.by_ig else f"Entry skipped: {failed} minimum stake too large"
     if exc.left_open:
         subject = f"ACTION NEEDED - {subject}, other leg left open"
     return subject, "\n".join(lines)
@@ -547,12 +594,14 @@ def apply_decision(
 
     if decision.action is Action.ENTER:
         notional, sizing = entry_notional(pair_config.strategy, risk, model, mids)
+        direction_i1 = direction_for_leg(decision.side, is_i1_leg=True)
+        direction_i2 = direction_for_leg(decision.side, is_i1_leg=False)
+        notional, sizing = _meet_minimum_stakes(
+            notional, sizing, {epic_i1: direction_i1, epic_i2: direction_i2}, rules, mids, instruments
+        )
         log.info("sizing: %s", sizing)
         size_i1 = compute_leg_size(notional, mids[epic_i1], rules[epic_i1])
         size_i2 = compute_leg_size(notional, mids[epic_i2], rules[epic_i2])
-
-        direction_i1 = direction_for_leg(decision.side, is_i1_leg=True)
-        direction_i2 = direction_for_leg(decision.side, is_i1_leg=False)
 
         attempted = {epic_i1: (direction_i1, size_i1), epic_i2: (direction_i2, size_i2)}
         # Normally i1 first. A leg IG has refused before goes first instead:

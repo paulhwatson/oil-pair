@@ -9,3 +9,6 @@ __pycache__/
 .DS_Store
 *.egg-info/
 _gsdata_/
+
+# Personal Claude Code permissions (e.g. allowing a read-only live-account check)
+.claude/settings.local.json

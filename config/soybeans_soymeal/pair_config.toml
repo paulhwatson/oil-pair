@@ -1,0 +1,31 @@
+# Soybeans vs soybean meal: the soy crush (beans are crushed into meal and
+# oil). Chosen from the physical-link screen and its re-run on IG's own prices
+# (2026-10-11): ~29 months of Yahoo data positive at all 27 settings in both
+# halves; on IG's 3 months, positive at all 27 settings overall (+£114/month
+# median), with Yahoo agreeing over the same window (+£103). Thresholds are
+# the IG grid's median, not its best. Sized by config/risk.toml. Grains trade
+# ~17 hours a day on IG (CBOT's overnight and day sessions).
+
+[instrument_a]
+epic = "CC.D.S.USS.IP"
+fmp_symbol = "SUSD"
+name = "Soybeans"
+expiry = "DFB"
+currency_code = "GBP"
+
+[instrument_b]
+epic = "CC.D.SM.USS.IP"
+fmp_symbol = "SMUSD"
+name = "Soybean Meal"
+expiry = "DFB"
+currency_code = "GBP"
+
+[strategy]
+notional_trade_size = 3000
+model_update_interval_business_days = 7
+entry_stds = 2.0
+limit_stds = 0.5
+stop_stds = 5.5
+poll_interval_seconds = 15
+warmup_minutes = 1440
+max_fit_lookback_days = 30

@@ -579,3 +579,71 @@ def test_without_a_risk_setting_the_fixed_notional_still_applies(model, rules, m
                    model, rules, mids)
 
     assert _sizes(client) == {"EPIC.A": 20.0, "EPIC.B": 40.0}  # the pair's own £2,000 notional_trade_size
+
+
+# --- IG's minimum stake keeps the legs balanced --------------------------------
+
+
+def _min_stake_config(notional):
+    return PairConfig(
+        instrument_a=InstrumentConfig(epic="EPIC.A", name="Heating Oil", expiry="DFB", currency_code="GBP"),
+        instrument_b=InstrumentConfig(epic="EPIC.B", name="Brent", expiry="DFB", currency_code="GBP"),
+        strategy=StrategyConfig(notional_trade_size=notional),
+    )
+
+
+HO_BRENT = {"EPIC.A": 46520.0, "EPIC.B": 10267.0}
+
+
+def test_a_leg_below_igs_minimum_scales_both_legs_not_just_that_one(model, rules):
+    """At £1,500 a leg, heating oil would be £0.032/pt - under IG's £0.04.
+    Rounding that leg up alone would leave it ~24% bigger than Brent's; both
+    go up together instead, to the £1,861 that £0.04/pt of heating oil is."""
+    client = SizeRecordingClient()
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), _min_stake_config(1500),
+                   model, rules, HO_BRENT)
+
+    sizes = _sizes(client)
+    assert sizes == {"EPIC.A": 0.04, "EPIC.B": 0.18}
+    notional_a, notional_b = sizes["EPIC.A"] * HO_BRENT["EPIC.A"], sizes["EPIC.B"] * HO_BRENT["EPIC.B"]
+    assert abs(notional_a / notional_b - 1) < 0.03  # still balanced, to the nearest penny of stake
+
+
+def test_an_entry_needing_too_much_extra_risk_is_skipped_without_trading(model, rules):
+    from oil_pair.main import MAX_MIN_STAKE_UPSCALE
+
+    client = SizeRecordingClient()
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    with pytest.raises(EntryFailedError) as exc:  # £1,000 -> £1,861 would be 1.86x
+        apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), _min_stake_config(1000),
+                       model, rules, HO_BRENT)
+
+    assert client.opened == []
+    assert exc.value.by_ig is False and exc.value.failed_epic == "EPIC.A"
+    assert f"limit {MAX_MIN_STAKE_UPSCALE:g}x" in exc.value.detail
+
+
+def test_legs_above_the_minimum_are_sized_as_before(model, rules):
+    client = SizeRecordingClient()
+    decision = Decision(action=Action.ENTER, side=PairSide.SHORT, stopped_out=False, reason="test")
+
+    apply_decision(client, decision, RunState(side=PairSide.FLAT, stopped_out=False), _min_stake_config(5000),
+                   model, rules, HO_BRENT)
+
+    assert _sizes(client) == {"EPIC.A": 0.11, "EPIC.B": 0.49}
+
+
+def test_a_skipped_entry_email_says_nothing_was_sent_to_ig(pair_config):
+    from oil_pair.main import _entry_failure_email
+
+    exc = EntryFailedError("EPIC.A", {"EPIC.A": ("SELL", 0.0215), "EPIC.B": ("BUY", 0.0974)},
+                           "not opened: IG's minimum stake of £0.04/pt on A needs £1,861 per leg, 1.9x ...", by_ig=False)
+
+    subject, body = _entry_failure_email(exc, PairSide.SHORT, pair_config, [], pd.Timestamp("2026-10-12T08:00Z"), 1)
+
+    assert subject == "Entry skipped: A minimum stake too large"
+    assert "Nothing was sent to IG" in body
+    assert "will be opened first" not in body

@@ -1,0 +1,29 @@
+# Brent vs heating oil: the diesel crack against Brent. Chosen from the
+# physical-link screen (2026-10-11): positive at all 27 settings in both
+# halves on IG's own prices (~3.6 months) and on ~29 months of Yahoo data.
+# Thresholds are the grid's median, not its best - no stop was hit in the
+# sample, so the stop level is untested. Sized by config/risk.toml.
+
+[instrument_a]
+epic = "CC.D.LCO.USS.IP"
+fmp_symbol = "BZUSD"
+name = "Oil - Brent Crude"
+expiry = "DFB"
+currency_code = "GBP"
+
+[instrument_b]
+epic = "CC.D.HO.USS.IP"
+fmp_symbol = "HOUSD"
+name = "Heating Oil"
+expiry = "DFB"
+currency_code = "GBP"
+
+[strategy]
+notional_trade_size = 3000
+model_update_interval_business_days = 7
+entry_stds = 2.0
+limit_stds = 0.25
+stop_stds = 5.5
+poll_interval_seconds = 15
+warmup_minutes = 1440
+max_fit_lookback_days = 30

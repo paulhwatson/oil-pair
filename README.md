@@ -16,6 +16,10 @@ configured pairs:
 - `arabica_robusta` — Coffee Arabica vs. Coffee Robusta (demo; the two
   markets overlap only ~8 hours a day, and the app trades only while both
   are open)
+- `brent_heating_oil` — Brent Crude vs. Heating Oil, the diesel crack
+  against Brent (demo; added 2026-10-11 from the physical-link screen)
+- `soybeans_soymeal` — Soybeans vs. Soybean Meal, the soy crush (demo;
+  added 2026-10-11 after re-checking the Yahoo screen on IG's own prices)
 
 ## Strategy
 
@@ -47,8 +51,14 @@ about the same whichever pair takes it. Before this, each pair had its own
 £200.
 
 - **It's approximate.** Dealing costs come on top, a price can jump past the
-  stop between 15-second checks, and a refit mid-trade moves the stop. If
-  the sizing falls below IG's minimum stake, the minimum is used.
+  stop between 15-second checks, and a refit mid-trade moves the stop.
+- **IG's minimum stake can raise the risk.** If either leg would fall below
+  IG's minimum stake, both legs are scaled up together so the pair stays
+  hedged. More is then at risk than the setting asks for, and the sizing
+  log line says by how much. Past 1.5× (`MAX_MIN_STAKE_UPSCALE`) the entry is
+  skipped: entries pause and an email explains why. Rounding just the short
+  leg up on its own would leave the pair out of balance. That would have
+  made brent_heating_oil's heating-oil leg 29% bigger than its Brent leg.
 - **There's a cap.** `max_notional_per_leg` caps any one leg, because a
   sharp drop in a pair's fitted std would otherwise ask for a very large
   position.
