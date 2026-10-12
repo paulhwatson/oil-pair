@@ -1,0 +1,54 @@
+# Per-instrument trading costs for scripts/backtest.py, keyed by IG epic.
+# Shared by every pair, since one instrument can be a leg of several.
+#
+# bid_offer_points: offer minus bid, in IG price points. Half is charged on
+# every fill, so a pair round trip costs size * bid_offer_points per leg.
+# min_deal_size: IG's dealingRules.minDealSize, the floor on a leg's size.
+#
+# Read from IG's demo API on 2026-10-12 at ~17:20 London, markets open.
+# Weekend and overnight quotes are wider (gasoline was ~60 points on a
+# weekend), so these flatter any strategy that trades at those times.
+
+["CC.D.LCO.USS.IP"]  # Brent Crude
+bid_offer_points = 3.0
+min_deal_size = 0.04
+
+["CC.D.CL.USS.IP"]  # US Crude (WTI)
+bid_offer_points = 5.2
+min_deal_size = 0.04
+
+["CC.D.RB.USS.IP"]  # Gasoline
+bid_offer_points = 20.0
+min_deal_size = 0.04
+
+["CC.D.HO.USS.IP"]  # Heating Oil
+bid_offer_points = 20.0
+min_deal_size = 0.04
+
+["CC.D.NG.USS.IP"]  # Natural Gas
+bid_offer_points = 4.0
+min_deal_size = 0.04
+
+["CS.D.USCGC.TODAY.IP"]  # Spot Gold
+bid_offer_points = 0.3
+min_deal_size = 1.0
+
+["CS.D.USCSI.TODAY.IP"]  # Spot Silver
+bid_offer_points = 4.0
+min_deal_size = 1.0
+
+["CC.D.KC.USS.IP"]  # Coffee Arabica
+bid_offer_points = 20.0
+min_deal_size = 0.04
+
+["CC.D.LKD.USS.IP"]  # Coffee Robusta (read while closed, EDITS_ONLY; may be wider than in hours)
+bid_offer_points = 4.0
+min_deal_size = 0.04
+
+["CC.D.S.USS.IP"]  # Soybeans
+bid_offer_points = 1.2
+min_deal_size = 0.04
+
+["CC.D.SM.USS.IP"]  # Soybean Meal
+bid_offer_points = 40.0
+min_deal_size = 0.04

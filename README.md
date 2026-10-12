@@ -310,6 +310,42 @@ All of `strategy_logic.py`'s math (hedge ratio, entry/exit decisions, leg
 sizing) is pure and unit-tested with synthetic data — no network/IG
 dependency required to run the test suite.
 
+## Backtesting
+
+```bash
+./.venv/bin/python scripts/backtest.py <pair_name>                # the configured rules
+./.venv/bin/python scripts/backtest.py <pair_name> --compare      # against each refinement below
+./.venv/bin/python scripts/backtest.py brent_wti --retrace-stds 0.25 --max-hold-hours 72 --trades
+```
+
+Replays stored prices through the same `fit_model` / `next_decision` /
+`compute_leg_size` the live loop uses, with the same warmup, lookback and
+refit schedule, and charges half of each leg's bid/offer on every fill. Costs
+live in `config/backtest_costs.toml`, keyed by epic; thresholds come from the
+pair's config unless overridden with `--entry-stds` / `--limit-stds` /
+`--stop-stds`.
+
+Prices come from ig-prices' hourly bars by default (`~/ig-price-data`,
+found by each instrument's `fmp_symbol`; months of history, decisions at bar
+closes only), or with `--source ticks` from this app's own
+`price_log/<pair_name>/ticks.csv` (the live feed, but only as far back as
+the app has run).
+
+Entry/exit refinements, each off by default:
+
+| option | what it does |
+|---|---|
+| `--confirm-minutes N` | the spread must stay beyond entry for N minutes first |
+| `--retrace-stds X` | then wait for it to come back X σ from its furthest point ("wait for the turn") |
+| `--max-hold-hours H` | time stop: close if not reverted within H hours |
+| `--blocked-hours 22-6` | no new entries in these Europe/London hours |
+
+`--compare` also splits each result into first and second halves by entry
+time, since a variant that only wins in one half is noise. Not simulated:
+moves inside a bar, slippage beyond the quoted bid/offer, and overnight
+funding. The backtester needs `pyarrow` (in `requirements.txt`) to read the
+hourly parquet.
+
 ## Known simplifications (intentional, not bugs)
 
 - **Live prices via IG's Lightstreamer feed** (`oil_pair/price_streamer.py`),
