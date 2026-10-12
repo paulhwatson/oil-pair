@@ -25,6 +25,7 @@ import os
 import re
 import smtplib
 import threading
+import time
 import urllib.parse
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -37,6 +38,14 @@ SMTP_TIMEOUT_SECONDS = 15
 WHATSAPP_URL = "https://api.callmebot.com/whatsapp.php"
 WHATSAPP_TIMEOUT_SECONDS = 20
 WHATSAPP_ENV_VAR = "NOTIFY_WHATSAPP"
+# CallMeBot accepts a long message but WhatsApp shows it cut off - the
+# 2026-10-12 digest stopped mid-sentence at roughly 1,000 characters while the
+# email was complete. Longer texts go as numbered parts, each under this many
+# UTF-8 bytes (£, ×, − and curly quotes take 2-3 bytes each).
+WHATSAPP_MAX_BYTES = 900
+# CallMeBot takes about one message every 2 seconds; parts sent faster may
+# be dropped or arrive out of order.
+WHATSAPP_GAP_SECONDS = 2.5
 
 _REQUIRED_ENV_VARS = ("SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD", "NOTIFY_EMAIL_TO")
 
@@ -124,6 +133,45 @@ def _scrub(text: str, recipient: WhatsAppRecipient) -> str:
     return text
 
 
+def _utf8_len(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def split_for_whatsapp(text: str, max_bytes: int = WHATSAPP_MAX_BYTES) -> list[str]:
+    """Split text into parts that each fit under max_bytes, numbered "(1/3)"
+    when there's more than one. Breaks fall between lines where possible,
+    then between words, and only mid-word for a single over-long word."""
+    budget = max_bytes - _utf8_len("(99/99) ")
+    pieces = []
+    for line in text.split("\n"):
+        while _utf8_len(line) > budget:  # an over-long line: break between words
+            cut = line.encode("utf-8")[:budget].decode("utf-8", "ignore")
+            space = cut.rfind(" ")
+            cut = cut[:space] if space > budget // 2 else cut
+            pieces.append(cut)
+            line = line[len(cut):].lstrip()
+        pieces.append(line)
+    parts, current = [], ""
+    for piece in pieces:
+        candidate = f"{current}\n{piece}" if current else piece
+        if current and _utf8_len(candidate) > budget:
+            parts.append(current)
+            current = piece
+        else:
+            current = candidate
+    if current or not parts:
+        parts.append(current)
+    if len(parts) == 1:
+        return parts
+    return [f"({i}/{len(parts)}) {part}" for i, part in enumerate(parts, start=1)]
+
+
+def _verdict(reply: str) -> str:
+    """CallMeBot's reply echoes the whole message, then its verdict; keep the verdict."""
+    found = re.search(r"(Message queued[^.]*\.|APIKey is invalid[^.]*\.|ERROR[^.]*\.|Error[^.]*\.)", reply)
+    return found.group(0) if found else reply[-160:]
+
+
 def whatsapp_url(recipient: WhatsAppRecipient, text: str) -> str:
     # %20 for spaces and %0A for new lines, as CallMeBot documents - not the
     # "+" for spaces that form-encoding (and requests' params=) would use.
@@ -156,21 +204,24 @@ class Notifier:
 
     def _deliver_whatsapp(self, recipient: WhatsAppRecipient, subject: str, body: str) -> None:
         text = f"*[oil-pair {self._pair_name}] {subject}*\n\n{body}"  # *...* is bold in WhatsApp
-        try:
-            response = requests.get(whatsapp_url(recipient, text), timeout=WHATSAPP_TIMEOUT_SECONDS)
-        except Exception as exc:  # noqa: BLE001 - see module docstring
-            # A requests error message quotes the URL, and the URL carries the key.
-            log.error("failed to send WhatsApp %r to %s: %s", subject, recipient.masked, _scrub(str(exc), recipient))
-            return
-        reply = _scrub(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", response.text or "")), recipient)
-        # CallMeBot echoes the whole message back before its verdict, so keep
-        # the tail, where the verdict is, rather than the head.
-        reply = re.sub(r"Text to send: .*?(?=(Message queued|ERROR|Error|error|APIKey|Note|$))", "", reply).strip()[-200:]
-        if response.status_code != 200:
-            log.error("failed to send WhatsApp %r to %s: HTTP %s %s", subject, recipient.masked,
-                      response.status_code, reply)
-            return
-        log.info("sent WhatsApp %r to %s (%s)", subject, recipient.masked, reply)
+        parts = split_for_whatsapp(text)
+        for number, part in enumerate(parts, start=1):
+            if number > 1:
+                time.sleep(WHATSAPP_GAP_SECONDS)
+            try:
+                response = requests.get(whatsapp_url(recipient, part), timeout=WHATSAPP_TIMEOUT_SECONDS)
+            except Exception as exc:  # noqa: BLE001 - see module docstring
+                # A requests error message quotes the URL, and the URL carries the key.
+                log.error("failed to send WhatsApp %r part %d/%d to %s: %s", subject, number, len(parts),
+                          recipient.masked, _scrub(str(exc), recipient))
+                return  # later parts would make no sense without this one
+            reply = _verdict(_scrub(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", response.text or "")), recipient))
+            if response.status_code != 200:
+                log.error("failed to send WhatsApp %r part %d/%d to %s: HTTP %s %s", subject, number, len(parts),
+                          recipient.masked, response.status_code, reply)
+                return
+        log.info("sent WhatsApp %r to %s%s (%s)", subject, recipient.masked,
+                 f" in {len(parts)} parts" if len(parts) > 1 else "", reply)
 
     def _deliver(self, subject: str, body: str) -> None:
         assert self._config is not None

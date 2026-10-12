@@ -233,3 +233,80 @@ def test_whatsapp_alone_is_enough_to_send(monkeypatch):
     Notifier("brent_wti", None, (PAUL,)).send("Opened LONG pair", "body")
 
     assert sent.wait(timeout=5)
+
+
+# --- long WhatsApp messages go as numbered parts (2026-10-12: digest cut off) ---
+
+from oil_pair.notify import WHATSAPP_MAX_BYTES, split_for_whatsapp  # noqa: E402
+
+
+def test_a_short_message_is_sent_whole():
+    assert split_for_whatsapp("Opened LONG pair\nspread -2.01 std") == ["Opened LONG pair\nspread -2.01 std"]
+
+
+def test_a_long_message_splits_at_line_breaks_into_numbered_parts():
+    lines = [f"wti_heating_oil: WATCH - line {i:02d} " + "x" * 80 for i in range(30)]
+    parts = split_for_whatsapp("\n".join(lines))
+
+    assert len(parts) > 1
+    assert all(len(p.encode("utf-8")) <= WHATSAPP_MAX_BYTES for p in parts)
+    assert parts[0].startswith(f"(1/{len(parts)}) ") and parts[-1].startswith(f"({len(parts)}/{len(parts)}) ")
+    rejoined = "\n".join(p.split(") ", 1)[1] for p in parts)
+    assert rejoined == "\n".join(lines)  # nothing lost, no line broken
+
+
+def test_one_over_long_line_splits_between_words():
+    words = " ".join(f"word{i}" for i in range(400))
+    parts = split_for_whatsapp(words)
+
+    assert len(parts) > 1
+    bodies = [p.split(") ", 1)[1] for p in parts]
+    assert " ".join(bodies) == words
+    assert all(b.split(" ")[-1].startswith("word") for b in bodies)  # no word cut in half
+
+
+def test_multi_byte_characters_count_in_bytes_not_letters():
+    text = "\n".join("£165 × 2 − 3 — “quoted” " * 6 for _ in range(12))
+    assert all(len(p.encode("utf-8")) <= WHATSAPP_MAX_BYTES for p in split_for_whatsapp(text))
+
+
+def test_parts_are_sent_in_order_with_a_gap(monkeypatch):
+    sent, slept = [], []
+    monkeypatch.setattr(notify.requests, "get", lambda url, timeout: sent.append(url) or FakeResponse())
+    monkeypatch.setattr(notify.time, "sleep", lambda s: slept.append(s))
+    body = "\n".join(f"line {i} " + "y" * 90 for i in range(30))
+
+    Notifier("news", None, (PAUL,))._deliver_all("Daily news", body)
+
+    texts = [parse_qs(urlparse(u).query)["text"][0] for u in sent]
+    assert len(texts) > 1 and texts[0].startswith(f"(1/{len(texts)}) *[oil-pair news] Daily news*")
+    assert [t.split(")", 1)[0] for t in texts] == [f"({i}" + f"/{len(texts)}" for i in range(1, len(texts) + 1)]
+    assert slept == [notify.WHATSAPP_GAP_SECONDS] * (len(texts) - 1)
+
+
+def test_a_failed_part_stops_the_rest(monkeypatch, caplog):
+    calls = []
+
+    def get(url, timeout):
+        calls.append(url)
+        return FakeResponse(203, "APIKey is invalid. Please create a new one.") if len(calls) == 2 else FakeResponse()
+
+    monkeypatch.setattr(notify.requests, "get", get)
+    monkeypatch.setattr(notify.time, "sleep", lambda s: None)
+    body = "\n".join(f"line {i} " + "y" * 90 for i in range(30))
+
+    Notifier("news", None, (PAUL,))._deliver_all("Daily news", body)
+
+    assert len(calls) == 2
+    assert "part 2/" in caplog.text and "APIKey is invalid" in caplog.text
+
+
+def test_the_log_keeps_callmebots_verdict_even_when_the_message_says_note(monkeypatch, caplog):
+    echo = "Message to: +447700900123 Text to send: FLAGS: 1%0ANote: Brent volatile. Message queued. You will receive it in a few seconds."
+    monkeypatch.setattr(notify.requests, "get", lambda url, timeout: FakeResponse(200, echo))
+
+    with caplog.at_level("INFO", logger="oil_pair.notify"):
+        Notifier("news", None, (PAUL,))._deliver_all("Daily news", "FLAGS: 1\nNote: Brent volatile.")
+
+    assert "(Message queued.)" in caplog.text
+    assert "Brent volatile" not in caplog.text
