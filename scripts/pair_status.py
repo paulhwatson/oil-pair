@@ -6,16 +6,13 @@ current price, and
 
   gross P&L   - the legs' move at mid prices since opening, before any cost
   costs       - bid/offer (half to open, half to close now; today's spread
-                stands in for the one paid at opening) plus IG's daily
-                financing charged or credited so far
+                stands in for the one paid at opening) plus IG's overnight
+                financing and admin fees charged or credited so far
   net P&L     - gross less costs: about what closing now would bank,
                 after financing
 
-Financing comes from IG's transaction history ("Daily Financing Adjustment -
-Commodities Basis"), which IG books per market, not per deal. Each charge is
-shared out by stake among the positions held in that market on that day -
-this app's open ones and any since closed - so where two pairs share a
-market (Brent) each gets its part.
+Overnight charges are shared out between positions in the same market as in
+oil_pair.costs, which the close emails use too.
 
 Usage:
     ./.venv/bin/python scripts/pair_status.py            # build and send
@@ -35,6 +32,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from oil_pair import costs  # noqa: E402
 from oil_pair.ig_client import IGClient  # noqa: E402
 from oil_pair.notify import Notifier, load_email_config, load_whatsapp_recipients  # noqa: E402
 from oil_pair.settings import REPO_ROOT, load_credentials  # noqa: E402
@@ -42,7 +40,6 @@ from oil_pair.state_store import load_state  # noqa: E402
 from oil_pair.strategy_logic import PairSide  # noqa: E402
 
 UK = "Europe/London"
-FINANCING = re.compile(r"Daily Financing Adjustment.*?for (\d+) day (.+)$")
 
 
 @dataclass(frozen=True)
@@ -81,50 +78,6 @@ class Leg:
         return 2 * self.half_spread * self.size
 
 
-def financing_cutoff(charged: pd.Timestamp) -> pd.Timestamp:
-    """IG charges financing on positions held at 22:00 UK and books it within
-    an hour or two; the cutoff a charge belongs to is the last 22:00 UK at or
-    before it was booked."""
-    local = charged.tz_convert(UK)
-    cutoff = local.normalize() + pd.Timedelta(hours=22)
-    if cutoff > local:
-        cutoff -= pd.Timedelta(days=1)
-    return cutoff.tz_convert("UTC")
-
-
-def _utc(value) -> pd.Timestamp:
-    ts = pd.Timestamp(value)
-    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
-
-
-def financing_share(transactions: pd.DataFrame, leg: Leg, others: list[Leg]) -> float:
-    """This leg's part of IG's per-market financing since it opened: + received, - paid.
-
-    Each charge is split by stake among the positions held in that market
-    across its 22:00 UK cutoff: still-open legs (this app's) and deals since
-    closed (the transaction history's DEAL rows). A deal opened and closed
-    within the day - like a refused entry's unwind - held nothing at the
-    cutoff and takes no share."""
-    if transactions.empty:
-        return 0.0
-    total = 0.0
-    deals = transactions[transactions.transactionType == "DEAL"]
-    for _, row in transactions.iterrows():
-        match = FINANCING.search(str(row.instrumentName))
-        if not match or match.group(2).strip() != leg.name:
-            continue
-        cutoff = financing_cutoff(_utc(row.dateUtc))
-        if leg.opened >= cutoff:
-            continue
-        held = [leg.size] + [o.size for o in others if o.name == leg.name and o.deal_id != leg.deal_id and o.opened < cutoff]
-        for _, d in deals[deals.instrumentName == leg.name].iterrows():
-            if _utc(d.openDateUtc) < cutoff < _utc(d.dateUtc):
-                held.append(abs(float(str(d["size"]).replace("+", ""))))
-        amount = float(re.sub(r"[^0-9.\-]", "", str(row.profitAndLoss)) or 0)
-        total += amount * leg.size / sum(held)
-    return total
-
-
 @dataclass(frozen=True)
 class PairStatus:
     name: str
@@ -134,6 +87,7 @@ class PairStatus:
     legs: tuple[Leg, ...]
     financing: float          # + received, - paid
     spread_std: str           # e.g. "-2.02 std (take profit 0.00, stop -5.50)" or ""
+    unbooked: bool = False    # held at the last 22:00 UK, but IG hasn't booked that charge yet
 
     @property
     def gross(self) -> float:
@@ -167,6 +121,8 @@ def format_report(statuses: list[PairStatus], flat: list[str], now: pd.Timestamp
             lines.append(f"  {leg.direction} £{leg.size:.2f}/pt {leg.name}: opened {leg.open_level:g}, now {leg.mid:g}")
         fin = (f"financing received {money(s.financing)}" if s.financing >= 0
                else f"financing paid {money(-s.financing)[1:]}")
+        if s.unbooked:
+            fin += "; IG hasn't booked the latest 22:00 UK charge yet"
         lines += [
             f"  Gross P&L: {money(s.gross)}",
             f"  Costs: {money(s.costs)[1:] if s.costs >= 0 else '-' + money(-s.costs)[1:]} "
@@ -213,10 +169,7 @@ def gather(dry_run: bool) -> tuple[list[PairStatus], list[str]]:
             client.login()
             clients[account] = client
             positions[account] = client.fetch_open_positions()
-            since = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=60)).strftime("%Y-%m-%dT00:00:00")
-            r = client.service._req("read", "/history/transactions",
-                                    {"type": "ALL", "from": since, "pageSize": 1000}, None, "2")
-            transactions[account] = pd.DataFrame(r.json().get("transactions", [])) if r.status_code == 200 else pd.DataFrame()
+            transactions[account] = costs.fetch_transactions(client, pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=60))
         cfg = tomllib.loads(cfg_path.read_text())
         names = {cfg[k]["epic"]: cfg[k]["name"] for k in ("instrument_a", "instrument_b")}
         pos = positions[account]
@@ -231,15 +184,20 @@ def gather(dry_run: bool) -> tuple[list[PairStatus], list[str]]:
             legs.append(Leg(names.get(r.epic, r.instrumentName), r.epic, r.dealId, r.direction, float(r["size"]),
                             float(r.level), pd.Timestamp(r.createdDateUTC, tz="UTC"), float(r.bid), float(r.offer)))
         statuses.append((pair, account, state, cfg, legs))
-    # financing needs every open leg in the account to share charges out fairly
-    out = []
+    # charges are shared out among every position open in the account, this app's or not
+    out, now = [], pd.Timestamp.now(tz="UTC")
     for pair, account, state, cfg, legs in statuses:
-        all_legs = [leg for p2, a2, _, _, l2 in statuses if a2 == account for leg in l2]
-        fin = sum(financing_share(transactions[account], leg, all_legs) for leg in legs)
-        opened = min(leg.opened for leg in legs) if legs else pd.Timestamp.now(tz="UTC")
+        pos, fin, unbooked = positions[account], 0.0, False
+        for leg in legs:
+            held = costs.Holding(leg.name, leg.size, leg.opened)
+            others = costs.holdings(pos[pos.dealId != leg.deal_id])
+            fin += costs.overnight_share(transactions[account], held, others)
+            unbooked = unbooked or costs.unbooked(transactions[account], held, now)
+        opened = min(leg.opened for leg in legs) if legs else now
         strat = cfg.get("strategy", {})
         out.append(PairStatus(pair, account, state.side.value, opened, tuple(legs), fin,
-                              spread_line(pair, state.side, strat.get("limit_stds", 0), strat.get("stop_stds", 0))))
+                              spread_line(pair, state.side, strat.get("limit_stds", 0), strat.get("stop_stds", 0)),
+                              unbooked))
     return out, flat
 
 

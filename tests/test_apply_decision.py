@@ -290,9 +290,75 @@ def test_exit_email_reports_igs_realised_pnl(pair_config, model, rules, mids):
 
     apply_decision(client, decision, state, pair_config, model, rules, mids, notifier)
 
-    assert notifier.sent == ["Closed SHORT pair (take profit): +£9.50"]
-    assert "Total: +£9.50 (IG's realised P&L)" in notifier.bodies[0]
+    assert notifier.sent == ["Closed SHORT pair (take profit): +£9.50 before financing"]
+    assert "P&L after bid/offer: +£9.50 (IG's figure, before financing)" in notifier.bodies[0]
     assert "At entry: +1.60" in notifier.bodies[0]
+
+
+class _Response:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+class ClientWithHistory(FakeClient):
+    """IG's transaction history and an open position held by another pair."""
+
+    def __init__(self, transactions, others, **kwargs):
+        super().__init__(**kwargs)
+        self._others = others
+        self.service = type("Service", (), {"_req": lambda _self, *args: _Response({"transactions": transactions})})()
+
+    def fetch_open_positions(self):
+        return self._others
+
+
+def test_exit_email_takes_igs_overnight_charges_off_the_realised_pnl(pair_config, model, rules, mids):
+    now = pd.Timestamp.now(tz="UTC")
+    opened = now - pd.Timedelta(days=3)
+    iso = lambda ts: ts.strftime("%Y-%m-%dT%H:%M:%S")  # noqa: E731
+    booked = iso(now - pd.Timedelta(seconds=1))
+    transactions = [
+        # A: paid, shared with another pair's equal A position
+        {"transactionType": "WITH", "instrumentName": "Daily Financing Adjustment - Commodities Basis for 1 day A",
+         "dateUtc": booked, "openDateUtc": booked, "size": "-", "profitAndLoss": "£-6.00"},
+        {"transactionType": "WITH", "instrumentName": "Daily Admin Fee - Commodities Interest for 1 day A",
+         "dateUtc": booked, "openDateUtc": booked, "size": "-", "profitAndLoss": "£-0.60"},
+        # B: received, held only by this pair
+        {"transactionType": "WITH", "instrumentName": "Daily Financing Adjustment - Commodities Basis for 1 day B",
+         "dateUtc": booked, "openDateUtc": booked, "size": "-", "profitAndLoss": "£2.00"},
+        # this pair's own legs, already in the history as closed deals
+        {"transactionType": "DEAL", "instrumentName": "A", "dateUtc": iso(now), "openDateUtc": iso(opened),
+         "size": "-10.0", "profitAndLoss": "£14.00"},
+        {"transactionType": "DEAL", "instrumentName": "B", "dateUtc": iso(now), "openDateUtc": iso(opened),
+         "size": "+20.0", "profitAndLoss": "£-4.50"},
+    ]
+    others = pd.DataFrame({"dealId": ["OTHER-PAIR"], "instrumentName": ["A"], "size": [10.0],
+                           "createdDateUTC": [iso(now - pd.Timedelta(days=5))]})
+    client = ClientWithHistory(
+        transactions, others,
+        confirms={"EPIC.A": {"level": 99.0, "profit": 14.0}, "EPIC.B": {"level": 50.2, "profit": -4.5}},
+    )
+    notifier = FakeNotifier()
+    decision = Decision(action=Action.EXIT_TAKE_PROFIT, side=PairSide.FLAT, stopped_out=False, reason="test")
+    state = RunState(
+        side=PairSide.SHORT, stopped_out=False,
+        leg_a=LegPosition(deal_id="DEAL-A", direction="SELL", size=10.0, open_level=100.4),
+        leg_b=LegPosition(deal_id="DEAL-B", direction="BUY", size=20.0, open_level=49.9),
+        opened_at=opened, entry_spread=1.6, entry_std_spread=1.0,
+    )
+
+    apply_decision(client, decision, state, pair_config, model, rules, mids, notifier)
+
+    # 9.50 realised; A's -6.60 split half and half with the other pair = -3.30; B +2.00
+    assert notifier.sent == ["Closed SHORT pair (take profit): +£8.20 after costs"]
+    assert "financing paid £1.30" in notifier.bodies[0]
+    assert "P&L after costs: +£8.20" in notifier.bodies[0]
 
 
 def test_a_broken_email_never_costs_the_trade_its_state(pair_config, model, rules, mids, monkeypatch):

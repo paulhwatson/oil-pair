@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 from trading_ig.rest import ApiExceededException, IGException, TokenInvalidException
 
-from oil_pair import instance_lock, price_log, trade_report
+from oil_pair import costs, instance_lock, price_log, trade_report
 from oil_pair.ig_client import IGClient, deal_accepted, describe_rejection, require_accepted
 from oil_pair.logging_setup import configure_logging
 from oil_pair.notify import Notifier, load_email_config, load_whatsapp_recipients
@@ -568,6 +568,32 @@ def _closed_leg_fill(
     )
 
 
+def _financing(
+    client: IGClient, state: RunState, pair_config: PairConfig, now: pd.Timestamp
+) -> trade_report.Financing | None:
+    """IG's overnight charges on this pair's legs while it was held, for the
+    close email - IG's realised P&L leaves them out. None if they can't be
+    worked out (no entry time or size recorded, or IG's history unavailable),
+    and the email then says so rather than guessing."""
+    legs = ((state.leg_a, pair_config.instrument_a), (state.leg_b, pair_config.instrument_b))
+    if state.opened_at is None or any(leg is None or leg.size is None for leg, _ in legs):
+        return None
+    try:
+        transactions = costs.fetch_transactions(client, state.opened_at - pd.Timedelta(days=1))
+        positions = client.fetch_open_positions()
+        if len(positions):
+            positions = positions[~positions["dealId"].isin([leg.deal_id for leg, _ in legs])]
+        others = costs.holdings(positions)
+        held = [costs.Holding(instrument.name, leg.size, costs.utc(state.opened_at)) for leg, instrument in legs]
+        return trade_report.Financing(
+            amount=sum(costs.overnight_share(transactions, h, others) for h in held),
+            unbooked=any(costs.unbooked(transactions, h, now) for h in held),
+        )
+    except Exception:
+        log.warning("could not read IG's overnight charges for the close email", exc_info=True)
+        return None
+
+
 def apply_decision(
     client: IGClient,
     decision,
@@ -715,12 +741,14 @@ def apply_decision(
 
     if remaining_leg_a is None and remaining_leg_b is None:
         outcome = "take profit" if decision.action is Action.EXIT_TAKE_PROFIT else "stop loss"
+        now = pd.Timestamp.now(tz="UTC")
         _notify(notifier, lambda: trade_report.closed(
             state.side, outcome, decision.reason,
             [_closed_leg_fill(leg, instrument, close_confirms)
              for leg, instrument in ((state.leg_a, pair_config.instrument_a), (state.leg_b, pair_config.instrument_b))],
-            model, mids, _names(pair_config), pd.Timestamp.now(tz="UTC"),
+            model, mids, _names(pair_config), now,
             opened_at=state.opened_at, entry_spread=state.entry_spread, entry_std_spread=state.entry_std_spread,
+            financing=_financing(client, state, pair_config, now),
         ))
         return RunState(side=PairSide.FLAT, stopped_out=decision.stopped_out)
     return replace(state, leg_a=remaining_leg_a, leg_b=remaining_leg_b, stopped_out=decision.stopped_out)

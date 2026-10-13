@@ -2,8 +2,8 @@
 
 The emails are the main way anyone sees a trade, usually on a phone, so each
 one carries what was dealt and at what prices, where the spread sits against
-the entry, take-profit and stop levels and - on a close - the realised
-result and how long the pair was held. Lines are "label: value" rather than
+the entry, take-profit and stop levels and - on a close - the result after
+costs and how long the pair was held. Lines are "label: value" rather than
 aligned columns, because a phone's mail app uses a proportional font.
 
 Pure formatting: no IG calls, so it can be tested on its own.
@@ -35,6 +35,14 @@ class LegFill:
     profit: float | None = None  # realised, in the account currency
     profit_from_ig: bool = False  # False when worked out from the fill levels
     closed_earlier: bool = False  # closed on an earlier attempt, so no close details here
+
+
+@dataclass(frozen=True)
+class Financing:
+    """IG's overnight charges booked against a pair while it was held."""
+
+    amount: float  # + received, - paid: daily financing plus the admin fee
+    unbooked: bool = False  # held at the last 22:00 UK, but that night's charges aren't booked yet
 
 
 def opened(
@@ -90,6 +98,7 @@ def closed(
     opened_at: pd.Timestamp | None = None,
     entry_spread: float | None = None,
     entry_std_spread: float | None = None,
+    financing: Financing | None = None,
 ) -> tuple[str, str]:
     spread = compute_spread(mids[model.i1_key], mids[model.i2_key], model.hedge_ratio)
     take_profit, stop = _exit_levels(side, model)
@@ -97,13 +106,8 @@ def closed(
     lines = [_sentence(reason), "", "Result"]
     for leg in legs:
         lines.append(_result_line(leg, mids))
-    profits = [leg.profit for leg in legs]
-    total = sum(profits) if all(p is not None for p in profits) else None
-    if total is not None:
-        source = "IG's realised P&L" if all(leg.profit_from_ig for leg in legs) else "from the fill levels"
-        lines.append(f"Total: {_pounds(total)} ({source})")
-    else:
-        lines.append("Total: not available - check IG's history for this trade")
+    totals, headline = _totals(legs, mids, financing)
+    lines += totals
     if opened_at is not None:
         lines.append(f"Held {_duration(now - opened_at)}: opened {_when(opened_at)}, closed {_when(now)}")
     else:
@@ -132,9 +136,78 @@ def closed(
     ]
 
     subject = f"Closed {side.value} pair ({outcome})"
-    if total is not None:
-        subject += f": {_pounds(total)}"
+    if headline:
+        subject += f": {headline}"
     return subject, "\n".join(lines)
+
+
+def _totals(legs: list[LegFill], mids: dict[str, float], financing: Financing | None) -> tuple[list[str], str]:
+    """The close's P&L lines - gross, costs, after costs, as in the status
+    report - and the figure for the subject.
+
+    IG's realised P&L is exact and already has the bid/offer in it (each leg
+    fills at the bid or offer), but not the overnight financing, which IG
+    books separately. Net is realised plus financing. Gross and the bid/offer
+    are estimates: the closing fills against the mids the decision was made
+    on, with opening assumed to have cost the same."""
+    profits = [leg.profit for leg in legs]
+    if any(p is None for p in profits):
+        return ["Total: not available - check IG's history for this trade"], ""
+    realised = sum(profits)
+    source = "IG's figure" if all(leg.profit_from_ig for leg in legs) else "from the fill levels"
+    bid_offer = _bid_offer(legs, mids)
+
+    lines = []
+    if bid_offer is not None:
+        lines.append(f"Gross P&L: {_pounds(realised + bid_offer)} (the move at mid prices)")
+    parts = [] if bid_offer is None else [f"bid/offer about £{bid_offer:,.2f}"]
+    if financing is None:
+        parts.append("financing not available - check IG's history")
+    else:
+        parts.append(_financing(financing))
+    if bid_offer is not None and financing is not None:
+        lines.append(f"Costs: {_cost(bid_offer - financing.amount)} ({', '.join(parts)})")
+    else:
+        lines.append(f"Costs: {', '.join(parts)}")
+
+    if financing is None:
+        lines.append(f"P&L after bid/offer: {_pounds(realised)} ({source}, before financing)")
+        return lines, f"{_pounds(realised)} before financing"
+    net = realised + financing.amount
+    lines += [
+        f"P&L after costs: {_pounds(net)}",
+        f"Realised: {_pounds(realised)} ({source}, after bid/offer, before financing)",
+    ]
+    return lines, f"{_pounds(net)} after costs"
+
+
+def _bid_offer(legs: list[LegFill], mids: dict[str, float]) -> float | None:
+    """About what the bid/offer cost, opening and closing: twice each closing
+    fill's distance from the mid. None if a leg's close isn't known."""
+    total = 0.0
+    for leg in legs:
+        if leg.size is None or leg.close_level is None or leg.epic not in mids:
+            return None
+        total += 2 * leg.size * abs(leg.close_level - mids[leg.epic])
+    return total
+
+
+def _financing(financing: Financing) -> str:
+    amount = financing.amount
+    if amount > 0:
+        text = f"financing received £{amount:,.2f}"
+    elif amount < 0:
+        text = f"financing paid £{-amount:,.2f}"
+    else:
+        text = "no financing" if financing.unbooked else "no financing (not held at 22:00 UK)"
+    if financing.unbooked:
+        text += "; IG hasn't booked the latest 22:00 UK charge yet"
+    return text
+
+
+def _cost(value: float) -> str:
+    """A cost, positive when paid: "£7.46", or "-£1.20" when financing received outweighs it."""
+    return f"£{value:,.2f}" if value >= 0 else f"-£{-value:,.2f}"
 
 
 def leg_profit(direction: str, size: float | None, open_level: float | None, close_level: float | None) -> float | None:
