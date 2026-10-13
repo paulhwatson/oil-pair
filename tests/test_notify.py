@@ -185,7 +185,8 @@ def test_every_recipient_gets_the_message_with_the_pair_in_bold(monkeypatch):
     Notifier("arabica_robusta", None, (PAUL, JAKE))._deliver_all("Opened LONG pair at -2.01 std", "body")
 
     assert [parse_qs(urlparse(u).query)["phone"][0] for u in urls] == [PAUL.phone, JAKE.phone]
-    assert parse_qs(urlparse(urls[0]).query)["text"][0] == "*[oil-pair arabica_robusta] Opened LONG pair at -2.01 std*\n\nbody"
+    assert parse_qs(urlparse(urls[0]).query)["text"][0] == \
+        "*[oil-pair arabica_robusta] Opened LONG pair at -2.01 std*\n\u200b\n\u200bbody"
 
 
 def test_email_still_goes_when_whatsapp_is_configured_too(monkeypatch):
@@ -310,3 +311,15 @@ def test_the_log_keeps_callmebots_verdict_even_when_the_message_says_note(monkey
 
     assert "(Message queued.)" in caplog.text
     assert "Brent volatile" not in caplog.text
+
+
+def test_no_whatsapp_line_starts_with_a_bare_word_callmebot_could_block(monkeypatch):
+    """2026-10-13: CallMeBot's server answered 403 to a report with a line
+    starting "Net P&L:" - read as a Windows `net` command after a line break."""
+    urls = []
+    monkeypatch.setattr(notify.requests, "get", lambda url, timeout: urls.append(url) or FakeResponse())
+
+    Notifier("status", None, (PAUL,))._deliver_all("Status", "Gross P&L: -£58.08\nNet P&L: -£57.25")
+
+    text = parse_qs(urlparse(urls[0]).query)["text"][0]
+    assert "\nNet" not in text and "\n\u200bNet P&L: -£57.25" in text

@@ -204,6 +204,11 @@ class Notifier:
 
     def _deliver_whatsapp(self, recipient: WhatsAppRecipient, subject: str, body: str) -> None:
         text = f"*[oil-pair {self._pair_name}] {subject}*\n\n{body}"  # *...* is bold in WhatsApp
+        # CallMeBot's web server blocks (HTTP 403) text where a line starts
+        # with what looks like a Windows command - "Net P&L: -£57.56" read as
+        # `net ...` after a line break (2026-10-13). An invisible zero-width
+        # space at the start of each line keeps any wording clear of that.
+        text = text.replace("\n", "\n\u200b")
         parts = split_for_whatsapp(text)
         for number, part in enumerate(parts, start=1):
             if number > 1:
