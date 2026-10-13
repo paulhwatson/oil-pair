@@ -20,6 +20,9 @@ configured pairs:
   against Brent (demo; added 2026-10-11 from the physical-link screen)
 - `soybeans_soymeal` — Soybeans vs. Soybean Meal, the soy crush (demo;
   added 2026-10-11 after re-checking the Yahoo screen on IG's own prices)
+- `corn_wheat` — Corn vs. Chicago Wheat, substitutes in animal feed (demo;
+  added 2026-10-13 from the physical-link screen; IG's own 3 months hold too
+  few trades to confirm it yet)
 
 ## Strategy
 
