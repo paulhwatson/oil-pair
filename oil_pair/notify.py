@@ -38,11 +38,14 @@ SMTP_TIMEOUT_SECONDS = 15
 WHATSAPP_URL = "https://api.callmebot.com/whatsapp.php"
 WHATSAPP_TIMEOUT_SECONDS = 20
 WHATSAPP_ENV_VAR = "NOTIFY_WHATSAPP"
-# CallMeBot accepts a long message but WhatsApp shows it cut off - the
-# 2026-10-12 digest stopped mid-sentence at roughly 1,000 characters while the
-# email was complete. Longer texts go as numbered parts, each under this many
-# UTF-8 bytes (£, ×, − and curly quotes take 2-3 bytes each).
-WHATSAPP_MAX_BYTES = 900
+# CallMeBot accepts a long message but WhatsApp shows it cut off, and the
+# limit is on the text as it travels in the URL, not as it reads: a space
+# goes as %20, £ as %C2%A3, the zero-width space before each line as
+# %E2%80%8B. The 2026-10-12 digest (plain text) stopped at roughly 1,000
+# characters; a 2026-10-14 trade message of only 820 characters, but ~1,380
+# encoded, stopped at about 1,250 encoded. Longer texts go as numbered parts,
+# each under this many URL-encoded characters.
+WHATSAPP_MAX_ENCODED = 1000
 # CallMeBot takes about one message every 2 seconds; parts sent faster may
 # be dropped or arrive out of order.
 WHATSAPP_GAP_SECONDS = 2.5
@@ -133,28 +136,39 @@ def _scrub(text: str, recipient: WhatsAppRecipient) -> str:
     return text
 
 
-def _utf8_len(text: str) -> int:
-    return len(text.encode("utf-8"))
+def _encoded_len(text: str) -> int:
+    """Length as CallMeBot receives it, URL-encoded as whatsapp_url sends it."""
+    return len(urllib.parse.quote(text, safe=""))
 
 
-def split_for_whatsapp(text: str, max_bytes: int = WHATSAPP_MAX_BYTES) -> list[str]:
-    """Split text into parts that each fit under max_bytes, numbered "(1/3)"
-    when there's more than one. Breaks fall between lines where possible,
-    then between words, and only mid-word for a single over-long word."""
-    budget = max_bytes - _utf8_len("(99/99) ")
+def _longest_prefix(text: str, budget: int) -> str:
+    used = 0
+    for i, char in enumerate(text):
+        used += _encoded_len(char)
+        if used > budget:
+            return text[:i]
+    return text
+
+
+def split_for_whatsapp(text: str, max_encoded: int = WHATSAPP_MAX_ENCODED) -> list[str]:
+    """Split text into parts that each fit under max_encoded URL-encoded
+    characters, numbered "(1/3)" when there's more than one. Breaks fall
+    between lines where possible, then between words, and only mid-word for a
+    single over-long word."""
+    budget = max_encoded - _encoded_len("(99/99) ")
     pieces = []
     for line in text.split("\n"):
-        while _utf8_len(line) > budget:  # an over-long line: break between words
-            cut = line.encode("utf-8")[:budget].decode("utf-8", "ignore")
+        while _encoded_len(line) > budget:  # an over-long line: break between words
+            cut = _longest_prefix(line, budget)
             space = cut.rfind(" ")
-            cut = cut[:space] if space > budget // 2 else cut
+            cut = cut[:space] if space > len(cut) // 2 else cut
             pieces.append(cut)
             line = line[len(cut):].lstrip()
         pieces.append(line)
     parts, current = [], ""
     for piece in pieces:
         candidate = f"{current}\n{piece}" if current else piece
-        if current and _utf8_len(candidate) > budget:
+        if current and _encoded_len(candidate) > budget:
             parts.append(current)
             current = piece
         else:
@@ -184,9 +198,11 @@ def whatsapp_url(recipient: WhatsAppRecipient, text: str) -> str:
 class Notifier:
     def __init__(
         self, pair_name: str, config: EmailConfig | None,
-        whatsapp: tuple[WhatsAppRecipient, ...] = (),
+        whatsapp: tuple[WhatsAppRecipient, ...] = (), account: str | None = None,
     ):
-        self._pair_name = pair_name
+        # account ("demo" or "live") goes in every header, so a message can't
+        # be mistaken for the other account's
+        self._tag = f"[oil-pair {pair_name}{f' {account.upper()}' if account else ''}]"
         self._config = config
         self._whatsapp = tuple(whatsapp)
 
@@ -203,7 +219,7 @@ class Notifier:
             self._deliver_whatsapp(recipient, subject, body)
 
     def _deliver_whatsapp(self, recipient: WhatsAppRecipient, subject: str, body: str) -> None:
-        text = f"*[oil-pair {self._pair_name}] {subject}*\n\n{body}"  # *...* is bold in WhatsApp
+        text = f"*{self._tag} {subject}*\n\n{body}"  # *...* is bold in WhatsApp
         # CallMeBot's web server blocks (HTTP 403) text where a line starts
         # with what looks like a Windows command - "Net P&L: -£57.56" read as
         # `net ...` after a line break (2026-10-13). An invisible zero-width
@@ -231,7 +247,7 @@ class Notifier:
     def _deliver(self, subject: str, body: str) -> None:
         assert self._config is not None
         message = EmailMessage()
-        message["Subject"] = f"[oil-pair {self._pair_name}] {subject}"
+        message["Subject"] = f"{self._tag} {subject}"
         message["From"] = self._config.sender
         message["To"] = self._config.recipient
         if self._config.cc:

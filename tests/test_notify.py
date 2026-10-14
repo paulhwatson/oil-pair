@@ -89,6 +89,22 @@ def test_send_tags_subject_with_pair_name(monkeypatch):
     assert FakeSMTP.sent[0]["Cc"] is None
 
 
+def test_the_account_is_in_every_header(monkeypatch):
+    FakeSMTP.sent = []
+    monkeypatch.setattr(notify.smtplib, "SMTP", FakeSMTP)
+    urls = []
+    monkeypatch.setattr(notify.requests, "get", lambda url, timeout: urls.append(url) or FakeResponse())
+
+    Notifier("brent_wti", _config(), (PAUL,), account="demo")._deliver_all("Opened LONG pair", "body")
+    Notifier("brent_wti", _config(), (PAUL,), account="live")._deliver_all("Opened LONG pair", "body")
+
+    assert [m["Subject"] for m in FakeSMTP.sent] == [
+        "[oil-pair brent_wti DEMO] Opened LONG pair", "[oil-pair brent_wti LIVE] Opened LONG pair"]
+    texts = [parse_qs(urlparse(u).query)["text"][0] for u in urls]
+    assert texts[0].startswith("*[oil-pair brent_wti DEMO] Opened LONG pair*")
+    assert texts[1].startswith("*[oil-pair brent_wti LIVE] Opened LONG pair*")
+
+
 def test_send_adds_cc_header_when_configured(monkeypatch):
     FakeSMTP.sent = []
     monkeypatch.setattr(notify.smtplib, "SMTP", FakeSMTP)
@@ -238,7 +254,13 @@ def test_whatsapp_alone_is_enough_to_send(monkeypatch):
 
 # --- long WhatsApp messages go as numbered parts (2026-10-12: digest cut off) ---
 
-from oil_pair.notify import WHATSAPP_MAX_BYTES, split_for_whatsapp  # noqa: E402
+import urllib.parse  # noqa: E402
+
+from oil_pair.notify import WHATSAPP_MAX_ENCODED, split_for_whatsapp  # noqa: E402
+
+
+def encoded(part):
+    return len(urllib.parse.quote(part, safe=""))
 
 
 def test_a_short_message_is_sent_whole():
@@ -250,7 +272,7 @@ def test_a_long_message_splits_at_line_breaks_into_numbered_parts():
     parts = split_for_whatsapp("\n".join(lines))
 
     assert len(parts) > 1
-    assert all(len(p.encode("utf-8")) <= WHATSAPP_MAX_BYTES for p in parts)
+    assert all(encoded(p) <= WHATSAPP_MAX_ENCODED for p in parts)
     assert parts[0].startswith(f"(1/{len(parts)}) ") and parts[-1].startswith(f"({len(parts)}/{len(parts)}) ")
     rejoined = "\n".join(p.split(") ", 1)[1] for p in parts)
     assert rejoined == "\n".join(lines)  # nothing lost, no line broken
@@ -266,9 +288,23 @@ def test_one_over_long_line_splits_between_words():
     assert all(b.split(" ")[-1].startswith("word") for b in bodies)  # no word cut in half
 
 
-def test_multi_byte_characters_count_in_bytes_not_letters():
+def test_multi_byte_characters_count_as_they_are_encoded():
     text = "\n".join("£165 × 2 − 3 — “quoted” " * 6 for _ in range(12))
-    assert all(len(p.encode("utf-8")) <= WHATSAPP_MAX_BYTES for p in split_for_whatsapp(text))
+    assert all(encoded(p) <= WHATSAPP_MAX_ENCODED for p in split_for_whatsapp(text))
+
+
+def test_a_short_message_padded_by_encoding_is_split():
+    """2026-10-14: an opening message of 820 characters (867 bytes, under the
+    old 900-byte limit) went whole and was cut off - with a zero-width space
+    on every line and a space every few letters it was ~1,380 URL-encoded."""
+    lines = [f"Take profit: when the spread falls below +0.00 (+0.00 std), line {i:02d}" for i in range(11)]
+    text = "\n\u200b".join(lines)
+    assert len(text) < 820 and encoded(text) > WHATSAPP_MAX_ENCODED
+
+    parts = split_for_whatsapp(text)
+
+    assert len(parts) == 2
+    assert all(encoded(p) <= WHATSAPP_MAX_ENCODED for p in parts)
 
 
 def test_parts_are_sent_in_order_with_a_gap(monkeypatch):

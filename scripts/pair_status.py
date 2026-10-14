@@ -212,7 +212,9 @@ def main() -> None:
     if args.dry_run:
         print(f"SUBJECT: {subject}\n\n{body}")
         return
-    Notifier("status", load_email_config(), load_whatsapp_recipients())._deliver_all(subject, body)
+    # the open pairs' account(s); none when everything is flat
+    account = "+".join(sorted({s.account for s in statuses})) or None
+    Notifier("status", load_email_config(), load_whatsapp_recipients(), account=account)._deliver_all(subject, body)
     print(f"sent: {subject}")
 
 

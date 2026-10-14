@@ -796,7 +796,8 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
             f"{risk.max_notional_per_leg if risk else DEFAULT_MAX_NOTIONAL_PER_LEG:,.0f}",
         )
 
-    notifier = Notifier(paths.pair_name, load_email_config(), load_whatsapp_recipients())
+    notifier = Notifier(paths.pair_name, load_email_config(), load_whatsapp_recipients(),
+                        account="live" if live else "demo")
 
     client = IGClient(creds)
     client.login()
