@@ -23,6 +23,10 @@ configured pairs:
 - `corn_wheat` — Corn vs. Chicago Wheat, substitutes in animal feed (demo;
   added 2026-10-13 from the physical-link screen; IG's own 3 months hold too
   few trades to confirm it yet)
+- `bp_brent` — BP shares vs. Brent Crude (demo; added 2026-10-16). Trades
+  only in London Stock Exchange hours. IG doesn't stream share prices through
+  its API, so BP is polled over REST every 15s while Brent streams; entries
+  are blocked on BP's ex-dividend days (`no_entry_dates` in its config)
 
 ## Strategy
 

@@ -1,0 +1,38 @@
+# BP shares vs Brent crude: BP's earnings, and so its share price, follow the
+# oil price it sells at, which is Brent. Screened 2026-10-16 with the live
+# rules: ~28 months of Yahoo hourly data positive at all 27 settings in both
+# halves (+£70/month median); IG's own Brent over the last 2.6 months agrees
+# (+£72/month, 21/27). Thresholds 2.0/0/5.5 rank 7th-8th of 27 on both and
+# are profitable in both halves of both. Sized by config/risk.toml.
+#
+# Trades only in London Stock Exchange hours (08:00-16:30 UK): outside them
+# BP isn't TRADEABLE and the pair waits. IG doesn't stream share prices
+# through its API, so BP is polled over REST every 15s (PriceStreamer); Brent
+# streams as usual. BP's starting history came from Yahoo (same pence scale).
+
+[instrument_a]
+epic = "KA.D.BP.DAILY.IP"
+name = "BP PLC"
+expiry = "DFB"
+currency_code = "GBP"
+
+[instrument_b]
+epic = "CC.D.LCO.USS.IP"
+fmp_symbol = "BZUSD"
+name = "Oil - Brent Crude"
+expiry = "DFB"
+currency_code = "GBP"
+
+[strategy]
+notional_trade_size = 3000
+model_update_interval_business_days = 7
+entry_stds = 2.0
+limit_stds = 0.0
+stop_stds = 5.5
+poll_interval_seconds = 15
+warmup_minutes = 1440
+max_fit_lookback_days = 30
+# BP's ex-dividend days: its price drops by the dividend (~1%) at the open for
+# no market reason. 12 Nov is expected from BP's pattern (13 Nov 2025);
+# confirm when BP announces it with its results on 30 Oct.
+no_entry_dates = ["2026-11-12"]
