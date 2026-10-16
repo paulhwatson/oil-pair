@@ -83,6 +83,10 @@ class StrategyConfig:
     max_fit_lookback_days: int = 30
     # Overrides config/risk.toml's max_loss_per_trade for this pair only.
     max_loss_per_trade: float | None = None
+    # UK dates ("YYYY-MM-DD") with no new entries - a share leg's ex-dividend
+    # days, when its price drops by the dividend for no market reason. Exits
+    # still happen as normal.
+    no_entry_dates: tuple[str, ...] = ()
 
 
 DEFAULT_RISK_CONFIG_PATH = REPO_ROOT / "config" / "risk.toml"

@@ -477,6 +477,13 @@ def _notify(notifier: Notifier | None, build) -> None:
     notifier.send(subject, body)
 
 
+def _no_entry_today(strategy: StrategyConfig, now: pd.Timestamp) -> bool:
+    """True on a date the pair's config rules out new entries (UK date) -
+    e.g. a share leg's ex-dividend day, when its price drops by the dividend
+    and the spread moves for no market reason."""
+    return now.tz_convert("Europe/London").strftime("%Y-%m-%d") in strategy.no_entry_dates
+
+
 def _account(client) -> str | None:
     """"demo" or "live" - the account `client` deals on. None for a client
     without credentials (the test fakes), which skips the account checks."""
@@ -810,12 +817,14 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
     save_state(state, paths.state)
 
     epic_a, epic_b = pair_config.instrument_a.epic, pair_config.instrument_b.epic
-    rules = {
-        epic_a: client.get_dealing_rules(epic_a),
-        epic_b: client.get_dealing_rules(epic_b),
-    }
+    markets = {epic: client.fetch_market(epic) for epic in (epic_a, epic_b)}
+    rules = {epic: float(market["dealingRules"]["minDealSize"]["value"]) for epic, market in markets.items()}
+    # IG won't stream some markets through its API at all - UK shares, for
+    # one - so those are polled over REST instead (see PriceStreamer).
+    polled = [epic for epic, market in markets.items()
+              if not market["instrument"].get("streamingPricesAvailable", True)]
 
-    streamer = PriceStreamer(client, [epic_a, epic_b])
+    streamer = PriceStreamer(client, [epic_a, epic_b], polled_epics=polled)
     streamer.start()
     try:
         streamer.wait_for_initial_prices()
@@ -875,7 +884,8 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
     consecutive_errors = 0
     entry_guard = EntryGuard()
     log.info(
-        "entering live loop (streamed prices, evaluated every %ds)", pair_config.strategy.poll_interval_seconds
+        "entering live loop (%s prices, evaluated every %ds)",
+        "streamed and polled" if polled else "streamed", pair_config.strategy.poll_interval_seconds,
     )
 
     try:
@@ -954,6 +964,8 @@ def _run_locked(paths: PairPaths, live: bool = False) -> None:
                         if decision.action is Action.ENTER and entry_guard.paused(now):
                             # Paused after a failed entry; exits are never held back.
                             decision = Decision(Action.NONE, state.side, state.stopped_out, "entries paused")
+                        if decision.action is Action.ENTER and _no_entry_today(strategy, now):
+                            decision = Decision(Action.NONE, state.side, state.stopped_out, "no entries today")
                         if decision.action is not Action.NONE:
                             log.info("decision: %s reason=%r spread=%.6f", decision.action, decision.reason, spread)
                         try:

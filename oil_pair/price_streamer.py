@@ -29,9 +29,15 @@ calls the latter every iteration until it clears, which it only does once a
 real price arrives - re-issuing the subscribe call is not itself evidence of
 recovery.
 
+Some markets IG won't stream through its API at all - UK shares, for one
+(streamingPricesAvailable is false even on a live account). Those are
+"polled epics": never subscribed, they get their quote and status from the
+same REST snapshot every poll_seconds instead, and count as fresh for
+staleness purposes as long as that poll succeeds.
+
 Historical seeding, dealing-rules lookups, and order placement/closing still
 go through IGClient's REST calls - only the per-iteration price read is
-push-based now.
+push-based now (or polled, for a polled epic).
 """
 
 from __future__ import annotations
@@ -55,6 +61,10 @@ DEFAULT_MAX_STALENESS_SECONDS = 60
 # boundaries, not tick by tick, so this is deliberately much slower than the
 # price feed - it only has to notice a close within a minute or so.
 DEFAULT_MARKET_STATUS_REFRESH_SECONDS = 60
+# How often a polled epic (one IG won't stream) is re-read over REST. Each
+# read is one request against the per-app limit all the pairs share, so this
+# is no faster than the loop needs: it evaluates every 15s.
+DEFAULT_POLL_SECONDS = 15
 UNKNOWN_STATUS = "UNKNOWN"
 # How long every leg may go without a streamed tick, with all markets open,
 # before it is logged as a possible dead stream (see _warn_if_stream_silent).
@@ -68,9 +78,15 @@ class PriceStreamer:
         epics: list[str],
         max_staleness_seconds: float = DEFAULT_MAX_STALENESS_SECONDS,
         market_status_refresh_seconds: float = DEFAULT_MARKET_STATUS_REFRESH_SECONDS,
+        polled_epics: list[str] = (),
+        poll_seconds: float = DEFAULT_POLL_SECONDS,
     ):
         self._ig_client = ig_client
         self._epics = list(epics)
+        self._polled = [e for e in self._epics if e in set(polled_epics)]
+        self._streamed = [e for e in self._epics if e not in set(polled_epics)]
+        self._poll_seconds = poll_seconds
+        self._polled_at: float | None = None
         self._max_staleness_seconds = max_staleness_seconds
         self._market_status_refresh_seconds = market_status_refresh_seconds
         self._lock = threading.Lock()
@@ -85,15 +101,18 @@ class PriceStreamer:
         self._silence_warned = False
 
     def start(self) -> None:
-        self._stream_service = IGStreamService(self._ig_client.service)
-        # trading_ig 0.0.22 never sets this itself (IGStreamService.acc_number
-        # stays None) - IG's Lightstreamer endpoint expects the account
-        # number as the LS username alongside the CST/XST token password.
-        self._stream_service.acc_number = self._ig_client.credentials.acc_number
-        self._stream_service.create_session(version="2")
-        self._stream_service.subscribe(self._build_subscription())
+        if self._streamed:
+            self._stream_service = IGStreamService(self._ig_client.service)
+            # trading_ig 0.0.22 never sets this itself (IGStreamService.acc_number
+            # stays None) - IG's Lightstreamer endpoint expects the account
+            # number as the LS username alongside the CST/XST token password.
+            self._stream_service.acc_number = self._ig_client.credentials.acc_number
+            self._stream_service.create_session(version="2")
+            self._stream_service.subscribe(self._build_subscription())
+            log.info("price stream subscribed: %s", self._streamed)
+        if self._polled:
+            log.info("polling over REST every %.0fs (IG doesn't stream these): %s", self._poll_seconds, self._polled)
         self._started_at = time.monotonic()
-        log.info("price stream subscribed: %s", self._epics)
 
         # Seed the status cache before the first read, so the loop is not
         # deciding tradeability from UNKNOWN on its first iteration.
@@ -102,7 +121,7 @@ class PriceStreamer:
     def _build_subscription(self) -> Subscription:
         subscription = Subscription(
             mode="DISTINCT",
-            items=[f"CHART:{epic}:TICK" for epic in self._epics],
+            items=[f"CHART:{epic}:TICK" for epic in self._streamed],
             fields=STREAM_FIELDS,
         )
         subscription.addListener(_MarketListener(self))
@@ -127,7 +146,8 @@ class PriceStreamer:
         next callback is usually another failure while the market stays
         closed). Only a real price arriving via _handle_update proves it.
         """
-        self._stream_service.subscribe(self._build_subscription())
+        if self._stream_service is not None:
+            self._stream_service.subscribe(self._build_subscription())
 
     def _handle_update(self, epic: str, bid: float | None, offer: float | None) -> None:
         """Called from Lightstreamer's own thread.
@@ -164,13 +184,14 @@ class PriceStreamer:
         known status and is retried on the next due tick - treating a blip in
         one REST call as "market closed" would stop trading for no reason.
         """
+        self._poll_if_due(force)
         now = time.monotonic()
         if not force and self._market_status_checked_at is not None:
             if now - self._market_status_checked_at < self._market_status_refresh_seconds:
                 return
 
         self._market_status_checked_at = now
-        for epic in self._epics:
+        for epic in self._streamed:
             requested_at = time.monotonic()
             try:
                 snapshot = self._ig_client.fetch_market(epic)["snapshot"]
@@ -210,6 +231,39 @@ class PriceStreamer:
 
         self._warn_if_stream_silent(now)
 
+    def _poll_if_due(self, force: bool = False) -> None:
+        """Re-read each polled epic's quote and status over REST, at most
+        every poll_seconds. Never raises, like the status refresh: a failed
+        poll keeps the last quote, which then ages towards the staleness
+        limit - so a REST outage surfaces exactly as a dead stream would."""
+        if not self._polled:
+            return
+        now = time.monotonic()
+        if not force and self._polled_at is not None and now - self._polled_at < self._poll_seconds:
+            return
+        self._polled_at = now
+        for epic in self._polled:
+            try:
+                snapshot = self._ig_client.fetch_market(epic)["snapshot"]
+                status = snapshot["marketStatus"]
+            except Exception as exc:  # noqa: BLE001 - see docstring
+                log.warning("could not poll %s: %s", epic, exc)
+                continue
+            bid, offer = _as_price(snapshot.get("bid")), _as_price(snapshot.get("offer"))
+            with self._lock:
+                previous = self._market_status.get(epic)
+                self._market_status[epic] = status
+                cached = self._latest.get(epic)
+                if bid is not None and offer is not None:
+                    self._latest[epic] = Snapshot(bid=bid, offer=offer, mid=(bid + offer) / 2, market_status=status)
+                    self._last_updated_at[epic] = time.monotonic()
+                elif cached is not None and cached.market_status != status:
+                    self._latest[epic] = Snapshot(
+                        bid=cached.bid, offer=cached.offer, mid=cached.mid, market_status=status
+                    )
+            if previous is not None and previous != status:
+                log.info("market status changed for %s: %s -> %s", epic, previous, status)
+
     def _warn_if_stream_silent(self, now: float) -> None:
         """Log when no leg has ticked for a long while with every market open.
 
@@ -219,8 +273,10 @@ class PriceStreamer:
         is normal; every leg silent for this long while all are open is not,
         so it is logged once per episode (and its end, from _handle_update).
         """
+        if not self._streamed:
+            return
         with self._lock:
-            all_open = all(self._market_status.get(epic) == "TRADEABLE" for epic in self._epics)
+            all_open = all(self._market_status.get(epic) == "TRADEABLE" for epic in self._streamed)
             last_tick = self._last_stream_tick_at if self._last_stream_tick_at is not None else self._started_at
             if last_tick is None or self._silence_warned or not all_open:
                 return

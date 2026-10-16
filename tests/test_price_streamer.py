@@ -420,3 +420,79 @@ def test_one_closed_leg_is_not_a_silent_stream(caplog, monkeypatch):
         streamer.peek_snapshot()
 
     assert not any("no streamed price" in r.getMessage() for r in caplog.records)
+
+
+# --- polled epics: markets IG won't stream through its API (UK shares) ---
+
+
+def polled_streamer(client, **kwargs):
+    return PriceStreamer(client, ["BRENT", "BP"], polled_epics=["BP"], market_status_refresh_seconds=600, **kwargs)
+
+
+def test_a_polled_epic_is_never_subscribed():
+    streamer = polled_streamer(FakeIGClient())
+    items = streamer._build_subscription().getItems()
+    assert list(items) == ["CHART:BRENT:TICK"]
+
+
+def test_a_polled_epic_gets_its_quote_and_status_over_rest():
+    client = FakeIGClient(statuses={"BP": "TRADEABLE"}, quotes={"BP": (450.0, 450.4)})
+    streamer = polled_streamer(client)
+
+    peek = streamer.peek_snapshot()
+
+    assert peek["BP"].mid == 450.2 and peek["BP"].market_status == "TRADEABLE"
+
+
+def test_a_polled_epic_is_re_read_only_once_the_poll_interval_is_up():
+    client = FakeIGClient(quotes={"BP": (450.0, 450.4)})
+    streamer = polled_streamer(client, poll_seconds=600)
+    streamer.peek_snapshot()
+    calls = client.calls
+
+    client.quotes["BP"] = (451.0, 451.4)
+    streamer.peek_snapshot()
+    assert client.calls == calls and streamer.peek_snapshot()["BP"].mid == 450.2
+
+    streamer._polled_at -= 601
+    assert streamer.peek_snapshot()["BP"].mid == 451.2
+
+
+def test_a_successful_poll_counts_as_fresh_and_failing_polls_go_stale():
+    client = FakeIGClient(quotes={"BP": (450.0, 450.4)})
+    streamer = polled_streamer(client, poll_seconds=0, max_staleness_seconds=0.05)
+    streamer._handle_update("BRENT", 100.0, 100.1)
+    prime(streamer)
+
+    assert streamer.latest_snapshot()["BP"].mid == 450.2
+
+    client.fail_with = RuntimeError("IG REST down")
+    time.sleep(0.1)
+    streamer._handle_update("BRENT", 100.0, 100.1)
+    with pytest.raises(RuntimeError, match="BP"):
+        streamer.latest_snapshot()
+
+
+def test_a_closed_polled_market_keeps_its_last_quote_with_the_new_status():
+    client = FakeIGClient(quotes={"BP": (450.0, 450.4)})
+    streamer = polled_streamer(client, poll_seconds=0)
+    streamer.peek_snapshot()
+
+    client.quotes.pop("BP")
+    client.statuses["BP"] = "EDITS_ONLY"
+    peek = streamer.peek_snapshot()
+
+    assert peek["BP"].mid == 450.2 and peek["BP"].market_status == "EDITS_ONLY"
+
+
+def test_only_streamed_epics_can_make_the_stream_look_silent(caplog, monkeypatch):
+    import oil_pair.price_streamer as price_streamer
+
+    monkeypatch.setattr(price_streamer, "STREAM_SILENCE_WARNING_SECONDS", 0.0)
+    streamer = PriceStreamer(FakeIGClient(quotes={"BP": (450.0, 450.4)}), ["BP"], polled_epics=["BP"])
+    streamer._started_at = time.monotonic() - 3600
+
+    with caplog.at_level("WARNING", logger="oil_pair.price_streamer"):
+        streamer.peek_snapshot()
+
+    assert not [r for r in caplog.records if "no streamed price" in r.getMessage()]

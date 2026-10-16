@@ -128,3 +128,17 @@ def test_a_pair_can_override_the_central_risk(tmp_path):
     )
 
     assert load_pair_config(path).strategy.max_loss_per_trade == 100
+
+
+def test_no_entry_dates_are_matched_on_the_uk_date():
+    from oil_pair.main import _no_entry_today
+    from oil_pair.settings import StrategyConfig
+    import pandas as pd
+
+    strategy = StrategyConfig(no_entry_dates=("2026-11-12",))
+    # November is GMT, so 23:30 UTC on the 11th is still the 11th in the UK
+    assert not _no_entry_today(strategy, pd.Timestamp("2026-11-11T23:30", tz="UTC"))
+    assert _no_entry_today(strategy, pd.Timestamp("2026-11-12T08:00", tz="UTC"))
+    # in summer time, 23:30 UTC is 00:30 the next day in the UK
+    assert _no_entry_today(StrategyConfig(no_entry_dates=("2026-08-13",)), pd.Timestamp("2026-08-12T23:30", tz="UTC"))
+    assert not _no_entry_today(StrategyConfig(), pd.Timestamp("2026-11-12T08:00", tz="UTC"))
