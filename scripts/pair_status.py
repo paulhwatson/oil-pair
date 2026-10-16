@@ -17,6 +17,9 @@ oil_pair.costs, which the close emails use too.
 Usage:
     ./.venv/bin/python scripts/pair_status.py            # build and send
     ./.venv/bin/python scripts/pair_status.py --dry-run  # print only
+
+Sent weekdays at 18:00 by launchd: see scripts/install_pair_status.sh. Each
+run logs to logs/status/.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from oil_pair import costs  # noqa: E402
 from oil_pair.ig_client import IGClient  # noqa: E402
+from oil_pair.logging_setup import configure_logging  # noqa: E402
 from oil_pair.notify import Notifier, load_email_config, load_whatsapp_recipients  # noqa: E402
 from oil_pair.settings import REPO_ROOT, load_credentials  # noqa: E402
 from oil_pair.state_store import load_state  # noqa: E402
@@ -207,6 +211,8 @@ def main() -> None:
     args = parser.parse_args()
     from dotenv import load_dotenv
     load_dotenv(REPO_ROOT / ".env")
+    if not args.dry_run:
+        configure_logging(log_dir=REPO_ROOT / "logs" / "status")
     statuses, flat = gather(args.dry_run)
     subject, body = format_report(statuses, flat, pd.Timestamp.now(tz="UTC"))
     if args.dry_run:
