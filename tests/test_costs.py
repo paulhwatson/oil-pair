@@ -102,3 +102,29 @@ def test_a_charge_not_yet_booked_is_flagged():
 def test_holdings_reads_igs_open_positions():
     positions = pd.DataFrame({"instrumentName": ["Oil - Brent Crude"], "size": [0.19], "createdDateUTC": ["2026-10-08T18:02:40"]})
     assert costs.holdings(positions) == [held()]
+
+
+def test_paging_reads_every_page_of_the_history():
+    pages = {1: [{"instrumentName": "a"}] * 2, 2: [{"instrumentName": "b"}]}
+    seen = []
+
+    class Response:
+        def __init__(self, page):
+            self.page = page
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"transactions": pages[self.page], "metadata": {"pageData": {"pageNumber": self.page, "totalPages": 2}}}
+
+    class Service:
+        def _req(self, method, path, params, session, version):
+            seen.append(params["pageNumber"])
+            return Response(params["pageNumber"])
+
+    client = type("Client", (), {"service": Service()})()
+
+    t = costs.fetch_transactions(client, pd.Timestamp("2026-09-01", tz="UTC"))
+
+    assert seen == [1, 2] and t.instrumentName.tolist() == ["a", "a", "b"]

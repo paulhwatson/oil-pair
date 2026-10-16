@@ -4,6 +4,8 @@ pandas
 scikit-learn
 python-dotenv
 tomli-w
+# scripts/pnl_spreadsheet.py builds its workbook with it
+openpyxl
 pytest
 # Already installed with trading-ig; listed because notify.py uses it directly.
 requests

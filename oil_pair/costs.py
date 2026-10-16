@@ -22,6 +22,7 @@ UK = "Europe/London"
 OVERNIGHT = re.compile(r"^Daily (?:Financing Adjustment|Admin Fee)\b.*? for \d+ day (.+)$")
 # A closed deal in the history is this position itself if it opened this close to it.
 SAME_DEAL_WITHIN = pd.Timedelta(minutes=2)
+PAGE_SIZE = 500
 
 
 @dataclass(frozen=True)
@@ -57,25 +58,32 @@ def _amount(value) -> float:
     return float(re.sub(r"[^0-9.\-]", "", str(value)) or 0)
 
 
-def _charges(transactions: pd.DataFrame, holding: Holding) -> list[tuple[pd.Timestamp, float]]:
-    """(cutoff, amount) for each overnight charge in this holding's market since it opened."""
+def _charges(
+    transactions: pd.DataFrame, holding: Holding, until: pd.Timestamp | None = None
+) -> list[tuple[pd.Timestamp, float]]:
+    """(cutoff, amount) for each overnight charge in this holding's market
+    while it was held: since it opened, and before `until` if it has closed."""
     out = []
     for _, row in transactions.iterrows():
         match = OVERNIGHT.search(str(row.instrumentName))
         if not match or match.group(1).strip() != holding.name:
             continue
         cutoff = financing_cutoff(utc(row.dateUtc))
-        if holding.opened < cutoff:
+        if holding.opened < cutoff and (until is None or cutoff < until):
             out.append((cutoff, _amount(row.profitAndLoss)))
     return out
 
 
-def overnight_share(transactions: pd.DataFrame, holding: Holding, others: list[Holding]) -> float:
-    """This holding's part of IG's overnight charges since it opened: + received, - paid.
+def overnight_share(
+    transactions: pd.DataFrame, holding: Holding, others: list[Holding], until: pd.Timestamp | None = None
+) -> float:
+    """This holding's part of IG's overnight charges while it was held: + received, - paid.
 
-    `others` are the other positions open in the account. If this holding has
-    just been closed, its own DEAL row in the history is recognised (same
-    market, size and opening time) and not counted a second time."""
+    `others` are the other positions open in the account. `until` is when the
+    holding closed, for one closed long ago; without it every charge since it
+    opened counts. If this holding has been closed, its own DEAL row in the
+    history is recognised (same market, size and opening time) and not
+    counted a second time."""
     if transactions.empty:
         return 0.0
     deals = transactions[(transactions.transactionType == "DEAL") & (transactions.instrumentName == holding.name)]
@@ -88,7 +96,7 @@ def overnight_share(transactions: pd.DataFrame, holding: Holding, others: list[H
             continue
         closed.append((opened, utc(d.dateUtc), size))
     total = 0.0
-    for cutoff, amount in _charges(transactions, holding):
+    for cutoff, amount in _charges(transactions, holding, until):
         held = holding.size
         held += sum(o.size for o in others if o.name == holding.name and o.opened < cutoff)
         held += sum(size for opened, shut, size in closed if opened < cutoff < shut)
@@ -107,10 +115,17 @@ def unbooked(transactions: pd.DataFrame, holding: Holding, now: pd.Timestamp) ->
 
 
 def fetch_transactions(client, since: pd.Timestamp) -> pd.DataFrame:
-    """IG's transaction history since `since` (v2 /history/transactions)."""
-    response = client.service._req(
-        "read", "/history/transactions",
-        {"type": "ALL", "from": utc(since).strftime("%Y-%m-%dT%H:%M:%S"), "pageSize": 1000}, None, "2",
-    )
-    response.raise_for_status()
-    return pd.DataFrame(response.json().get("transactions", []))
+    """IG's transaction history since `since` (v2 /history/transactions), every page of it."""
+    rows, page, pages = [], 1, 1
+    while page <= pages:
+        response = client.service._req(
+            "read", "/history/transactions",
+            {"type": "ALL", "from": utc(since).strftime("%Y-%m-%dT%H:%M:%S"), "pageSize": PAGE_SIZE,
+             "pageNumber": page}, None, "2",
+        )
+        response.raise_for_status()
+        body = response.json()
+        rows += body.get("transactions", [])
+        pages = int((body.get("metadata") or {}).get("pageData", {}).get("totalPages") or 1)
+        page += 1
+    return pd.DataFrame(rows)
