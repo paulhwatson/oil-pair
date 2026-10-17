@@ -28,6 +28,16 @@ configured pairs:
   its API, so BP is polled over REST every 15s while Brent streams; entries
   are blocked on BP's ex-dividend days (`no_entry_dates` in its config)
 
+## Dashboard
+
+`dashboard/app.py` is a read-only page with every pair's position, where its
+spread sits against its entry, take-profit and stop, and its running
+profitability since 5 Oct (IG's banked figures plus open trades marked at
+mid). launchd keeps it running at http://localhost:8501
+(`./scripts/install_dashboard.sh install`; `install --phone` also serves it
+to your home network). Each weekday at 18:05 the same figures are also
+written to `~/Documents/oil-pair P&L.numbers` (`scripts/pnl_spreadsheet.py`).
+
 ## Strategy
 
 OLS hedge ratio (no intercept) between the two instruments' mid prices,
