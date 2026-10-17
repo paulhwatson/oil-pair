@@ -80,3 +80,40 @@ def test_running_pnl_includes_the_position_open_now():
     run = figures.running_pnl([], open_now, mids, {}, grid[0], grid[-1])
 
     assert run.tolist() == pytest.approx([0.0, -0.5, -1.0])
+
+
+def test_close_messages_are_read_once_each_with_their_entry_time(tmp_path):
+    log = tmp_path / "oil_pair.log"
+    log.write_text(
+        "2026-10-14 09:16:15,275 INFO __main__: ENTER PairSide.SHORT: SELL A size=0.14, BUY B size=1.2\n"
+        "2026-10-16 17:25:24,534 INFO oil_pair.notify: emailed 'Closed SHORT pair (stop loss): -£175.17 after costs' "
+        "to x@example.com\n"
+        "2026-10-16 17:25:27,468 INFO oil_pair.notify: sent WhatsApp 'Closed SHORT pair (stop loss): -£175.17 after "
+        "costs' to …999 in 2 parts (Message queued.)\n"
+        "2026-10-06 13:09:03,328 INFO oil_pair.notify: emailed 'Closed LONG pair (take profit): -£7.24' to x\n"
+    )
+
+    closes = figures.read_log(log, pd.Timestamp("2026-10-17T12:00", tz=UTC)).closes
+
+    assert len(closes) == 2
+    stop = [c for c in closes if c.exit == "stop loss"][0]
+    assert stop.net == -175.17 and stop.after_costs and stop.side == "SHORT"
+    assert stop.opened == pd.Timestamp("2026-10-14T08:16:15", tz=UTC)
+    old = [c for c in closes if c.exit == "take profit"][0]
+    assert old.net == -7.24 and not old.after_costs
+
+
+def test_a_logged_close_counts_only_until_ig_records_it():
+    close = figures.LoggedClose(pd.Timestamp("2026-10-14T08:16", tz=UTC), pd.Timestamp("2026-10-16T16:25:24", tz=UTC),
+                                "SHORT", "stop loss", -175.17, True)
+    since = pd.Timestamp("2026-10-05", tz=UTC)
+    in_ig = Trade("arabica_robusta", "demo", (leg("A", -0.14, "2026-10-14T08:16", "2026-10-16T16:25:21", 1, 1, -100),))
+
+    assert figures.not_yet_in_ig((close,), [], since) == [close]
+    assert figures.not_yet_in_ig((close,), [in_ig], since) == []
+
+
+def test_a_logged_close_of_a_trade_opened_before_the_cut_off_is_left_out():
+    early = figures.LoggedClose(pd.Timestamp("2026-10-02T13:00", tz=UTC), pd.Timestamp("2026-10-06T12:09", tz=UTC),
+                                "LONG", "take profit", -7.24, False)
+    assert figures.not_yet_in_ig((early,), [], pd.Timestamp("2026-10-05", tz=UTC)) == []

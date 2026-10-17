@@ -35,8 +35,7 @@ spread sits against its entry, take-profit and stop, and its running
 profitability since 5 Oct (IG's banked figures plus open trades marked at
 mid). launchd keeps it running at http://localhost:8501
 (`./scripts/install_dashboard.sh install`; `install --phone` also serves it
-to your home network). Each weekday at 18:05 the same figures are also
-written to `~/Documents/oil-pair P&L.numbers` (`scripts/pnl_spreadsheet.py`).
+to your home network).
 
 ## Strategy
 

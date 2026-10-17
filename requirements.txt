@@ -4,8 +4,6 @@ pandas
 scikit-learn
 python-dotenv
 tomli-w
-# scripts/pnl_spreadsheet.py builds its workbook with it
-openpyxl
 # the dashboard (dashboard/app.py)
 streamlit
 plotly

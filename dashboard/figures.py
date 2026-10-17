@@ -32,6 +32,25 @@ _SPREAD = re.compile(
     r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ INFO __main__: spread=(\S+) \((\S+) std\) .*?side=PairSide\.(\w+)"
 )
 _LEVEL = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ (ERROR|CRITICAL) ")
+_ENTER = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ INFO __main__: ENTER PairSide\.(\w+)")
+# The close message's subject, as notify logs it: "Closed SHORT pair (stop loss): -£175.17 after costs"
+_CLOSED = re.compile(
+    r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ INFO oil_pair\.notify: (?:emailed|sent WhatsApp) "
+    r"'Closed (\w+) pair \(([^)]*)\): ([+-])£([\d,]+\.\d\d)( after costs| before financing)?'"
+)
+
+
+@dataclass(frozen=True)
+class LoggedClose:
+    """A close as the pair's own close message reported it - used until IG's
+    transaction history, which can lag by hours or a weekend, records it."""
+
+    opened: pd.Timestamp | None
+    closed: pd.Timestamp
+    side: str
+    exit: str
+    net: float               # after costs when after_costs, else before financing
+    after_costs: bool
 
 
 @dataclass(frozen=True)
@@ -39,12 +58,13 @@ class LogView:
     spread: pd.DataFrame          # index UTC time; columns z, side
     last_line_at: pd.Timestamp | None
     recent_errors: list[str]      # ERROR/CRITICAL lines from the last 24 hours
+    closes: tuple = ()            # LoggedClose, oldest first
 
 
 def read_log(path: Path, now: pd.Timestamp, rotated: int = 1) -> LogView:
     """The pair's spread history and health from its log (and `rotated` older files)."""
     files = [p for p in [path.with_name(f"{path.name}.{i}") for i in range(rotated, 0, -1)] + [path] if p.exists()]
-    rows, errors, last = [], [], None
+    rows, errors, last, enters, closes = [], [], None, [], []
     since = (now - pd.Timedelta(hours=24)).tz_convert(UK).strftime("%Y-%m-%d %H:%M:%S")
     for f in files:
         with f.open(errors="replace") as handle:
@@ -53,13 +73,32 @@ def read_log(path: Path, now: pd.Timestamp, rotated: int = 1) -> LogView:
                     rows.append((m.group(1), float(m.group(3)), m.group(4)))
                 elif (m := _LEVEL.match(line)) and m.group(1) >= since:
                     errors.append(line.strip())
+                elif m := _ENTER.match(line):
+                    enters.append(m.group(1))
+                elif m := _CLOSED.match(line):
+                    amount = float(m.group(5).replace(",", "")) * (-1 if m.group(4) == "-" else 1)
+                    opened = max((e for e in enters if e <= m.group(1)), default=None)
+                    closes.append((opened, m.group(1), m.group(2), m.group(3), amount, m.group(6) == " after costs"))
                 if line[:4].isdigit():
                     last = line[:19]
     spread = pd.DataFrame(rows, columns=["at", "z", "side"])
     spread["at"] = _uk(spread["at"])
     # the hour the clocks go back repeats, so its times can't be placed: dropped
     spread = spread.dropna(subset=["at"]).drop_duplicates("at", keep="last").set_index("at").sort_index()
-    return LogView(spread, _uk(pd.Series([last]))[0] if last else None, errors[-20:])
+    logged = {}
+    for opened, closed, side, exit_, amount, after_costs in closes:   # email and WhatsApp both log it: once each
+        at = _uk(pd.Series([closed]))[0]
+        if pd.isna(at) or any(abs(at - k) <= pd.Timedelta(minutes=2) for k in logged):
+            continue
+        logged[at] = LoggedClose(_uk(pd.Series([opened]))[0] if opened else None, at, side, exit_, amount, after_costs)
+    return LogView(spread, _uk(pd.Series([last]))[0] if last else None, errors[-20:], tuple(logged.values()))
+
+
+def not_yet_in_ig(closes: tuple, trades: list, since: pd.Timestamp) -> list:
+    """Logged closes of trades opened since `since` (as the IG trades shown are)
+    that IG's history doesn't have yet: no IG trade closed within five minutes."""
+    return [c for c in closes if (c.opened if c.opened is not None else c.closed) >= since
+            and not any(abs(t.closed - c.closed) <= pd.Timedelta(minutes=5) for t in trades)]
 
 
 def _uk(text: pd.Series) -> pd.Series:
@@ -86,10 +125,12 @@ class OpenLeg:
 
 def running_pnl(
     trades: list[Trade], open_legs: list[OpenLeg], mids: pd.DataFrame, names: dict[str, str],
-    start: pd.Timestamp, now: pd.Timestamp, freq: str = "15min",
+    start: pd.Timestamp, now: pd.Timestamp, freq: str = "15min", logged: list = (),
 ) -> pd.Series:
     """One pair's running profitability: banked after costs, plus whatever is
-    open marked to market at mid. `names` maps IG instrument names to epics."""
+    open marked to market at mid. `names` maps IG instrument names to epics;
+    `logged` are closes IG's history doesn't have yet, which step in at their
+    logged P&L (their path while open isn't known here)."""
     grid = pd.date_range(start.floor(freq), now.floor(freq), freq=freq, tz="UTC")
     marks = mids.reindex(grid, method="ffill") if len(mids) else pd.DataFrame(index=grid)
     out = pd.Series(0.0, index=grid)
@@ -101,6 +142,8 @@ def running_pnl(
     for leg in open_legs:
         held = out.index >= leg.opened
         out[held] += _mark(marks, leg.epic, leg.size, leg.open_level)[held]
+    for c in logged:
+        out[out.index >= c.closed] += c.net
     return out
 
 

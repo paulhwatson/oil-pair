@@ -137,3 +137,15 @@ def test_read_log_finds_legs_and_exits(tmp_path):
         LogEvent("brent_wti", pd.Timestamp("2026-10-13T16:21:33", tz="UTC"), "take profit"),       # BST
         LogEvent("brent_wti", pd.Timestamp("2026-10-05T11:22:09", tz="UTC"), "Oil - Brent Crude"),
     ]
+
+
+def test_load_pairs_reads_each_pairs_two_markets(tmp_path):
+    cfg = tmp_path / "brent_wti" / "pair_config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text('[instrument_a]\nepic = "CC.D.LCO.USS.IP"\nname = "Oil - Brent Crude"\n'
+                   '[instrument_b]\nepic = "CC.D.CL.USS.IP"\nname = "Oil - US Crude"\n')
+
+    (pair,) = ledger.load_pairs(tmp_path)
+
+    assert pair.pair == "brent_wti"
+    assert pair.names == {"Oil - Brent Crude", "Oil - US Crude"}

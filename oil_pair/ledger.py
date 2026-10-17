@@ -19,6 +19,7 @@ trade's P&L after costs is what IG actually booked for it.
 from __future__ import annotations
 
 import re
+import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -217,6 +218,33 @@ def _from_markets(g, pairs, by_markets, first_paired) -> str | None:
         earlier = [c for c, at in started.items() if at <= g[0].opened]
         candidates = earlier or ([min(started, key=started.get)] if started else candidates)
     return candidates[0] if len(candidates) == 1 else None
+
+
+def load_pairs(config_dir: Path) -> list[PairMarkets]:
+    """Every configured pair's markets (config/<pair>/pair_config.toml)."""
+    pairs = []
+    for path in sorted(config_dir.glob("*/pair_config.toml")):
+        cfg = tomllib.loads(path.read_text())
+        epics = {cfg[k]["epic"]: cfg[k]["name"] for k in ("instrument_a", "instrument_b")}
+        pairs.append(PairMarkets(path.parent.name, epics))
+    return pairs
+
+
+def read_pair_logs(pairs: list[PairMarkets], logs_dir: Path) -> list[LogEvent]:
+    """The legs every pair opened, and its exits, from its logs (logs/<pair>/oil_pair.log*)."""
+    events = []
+    for pair in pairs:
+        for path in sorted((logs_dir / pair.pair).glob("oil_pair.log*")):
+            events += read_log(path, pair)
+    return events
+
+
+def ig_closed_trades(client, pairs: list[PairMarkets], logs_dir: Path, since: pd.Timestamp,
+                     account: str = "demo") -> list[Trade]:
+    """Every closed pair trade in the account's IG history since `since`."""
+    transactions = costs.fetch_transactions(client, since)
+    open_now = costs.holdings(client.fetch_open_positions())
+    return build_trades(transactions, pairs, account, read_pair_logs(pairs, logs_dir), open_now)
 
 
 def banked_by_day(trades: list[Trade], pairs: list[str], days: pd.DatetimeIndex) -> pd.DataFrame:

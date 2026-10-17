@@ -28,6 +28,11 @@ from oil_pair.strategy_logic import PairSide  # noqa: E402
 
 UK = "Europe/London"
 IG_REFRESH_SECONDS = 300      # IG is one request budget all the pairs share
+HISTORY_START = pd.Timestamp("2026-09-01", tz="UTC")  # the demo account's first deal
+# Only trades opened from Mon 5 Oct count: when the strategy began running as
+# designed (fits on one price an hour over 30 days). IG's history is still read
+# from HISTORY_START, as deals held then can share later overnight charges.
+TRADES_FROM = pd.Timestamp("2026-10-05", tz=UK)
 PAGE_REFRESH_SECONDS = 30
 TOTAL = "All pairs"
 
@@ -46,11 +51,23 @@ def ig_figures() -> tuple[list, dict, pd.Timestamp]:
     """Closed trades since 5 Oct and open positions, from IG."""
     _env()
     import pair_status
-    import pnl_spreadsheet
-    pairs = pnl_spreadsheet.load_pairs()
-    trades = [t for t in pnl_spreadsheet.closed_trades(pairs) if t.opened >= pnl_spreadsheet.TRADES_FROM]
+    from oil_pair import ledger
+    from oil_pair.ig_client import IGClient
+    from oil_pair.settings import load_credentials
+    client = IGClient(load_credentials(live=False))
+    client.login()
+    pairs = ledger.load_pairs(ROOT / "config")
+    trades = [t for t in ledger.ig_closed_trades(client, pairs, ROOT / "logs", HISTORY_START)
+              if t.opened >= TRADES_FROM]
     statuses, _ = pair_status.gather(dry_run=True)
     return trades, {s.name: s for s in statuses}, pd.Timestamp.now(tz="UTC")
+
+
+def split_lone_legs(trades: list) -> tuple[list, list]:
+    """(pair trades, lone legs). A lone leg is one market traded alone - an
+    entry IG half-refused, unwound at once. Left out of every figure here so
+    they don't distort the pairs' statistics; listed in the footer instead."""
+    return [t for t in trades if len(t.markets) == 2], [t for t in trades if len(t.markets) != 2]
 
 
 @st.cache_data(ttl=PAGE_REFRESH_SECONDS - 5)
@@ -79,9 +96,10 @@ def page() -> None:
     except Exception as exc:  # noqa: BLE001 - show the page with what's local
         st.error(f"Couldn't read IG just now ({exc}) - showing local figures only.")
         trades, statuses, ig_at = [], {}, None
+    ig_trades = trades
+    trades, lone_legs = split_lone_legs(trades)
 
-    import pnl_spreadsheet
-    start = pnl_spreadsheet.TRADES_FROM.tz_convert("UTC")
+    start = TRADES_FROM.tz_convert("UTC")
     pairs = {p.parent.name: load_pair_config(p) for p in sorted((ROOT / "config").glob("*/pair_config.toml"))}
 
     rows, curves, views = [], {}, {}
@@ -90,14 +108,16 @@ def page() -> None:
         names = {cfg.instrument_a.name: epics[0], cfg.instrument_b.name: epics[1]}
         log, mids, running = local_figures(name, epics)
         mine = [t for t in trades if t.pair == name]
+        # closes IG's history hasn't recorded yet (it can lag a weekend), from the pair's close messages
+        logged = figures.not_yet_in_ig(log.closes, [t for t in ig_trades if t.pair == name], start)
         status = statuses.get(name)
         open_legs = [figures.OpenLeg(leg.epic, leg.size * (1 if leg.direction == "BUY" else -1), leg.open_level, leg.opened)
                      for leg in (status.legs if status else ())]
-        curves[name] = figures.running_pnl(mine, open_legs, mids, names, start, now)
-        views[name] = (cfg, log, mine, status)
+        curves[name] = figures.running_pnl(mine, open_legs, mids, names, start, now, logged=logged)
+        views[name] = (cfg, log, mine, status, logged)
         state = load_state(ROOT / "state" / name / "run_state.json")
-        paired = [t for t in mine if len(t.markets) == 2]
-        banked = sum(t.net for t in mine)
+        nets = [t.net for t in mine] + [c.net for c in logged]
+        banked = sum(nets)
         open_pnl = status.net if status else 0.0
         z = log.spread["z"].iloc[-1] if len(log.spread) else None
         s = cfg.strategy
@@ -110,8 +130,8 @@ def page() -> None:
             "Position": position, "Spread now (std)": z,
             "Entry / take profit / stop": f"±{s.entry_stds:g} / ±{s.limit_stds:g} / ±{s.stop_stds:g}",
             "Open P&L after costs": open_pnl if status else None, "Banked since 5 Oct": banked,
-            "Total": banked + open_pnl, "Closed trades": len(paired),
-            "Win rate": (sum(t.net > 0 for t in paired) / len(paired)) if paired else None,
+            "Total": banked + open_pnl, "Closed trades": len(nets),
+            "Win rate": (sum(n > 0 for n in nets) / len(nets)) if nets else None,
             "Process": "running" if running else "STOPPED",
             "Last log line": ago(log.last_line_at, now), "Errors (24h)": len(log.recent_errors),
         })
@@ -165,7 +185,7 @@ def page() -> None:
     left, right = st.columns([2, 1])
     choice = left.selectbox("Pair", list(dict.fromkeys(open_first)), label_visibility="collapsed")
     days = right.slider("Days of spread history", 1, 30, 7)
-    cfg, log, mine, status = views[choice]
+    cfg, log, mine, status, logged = views[choice]
     s = cfg.strategy
     spread = log.spread[log.spread.index >= now - pd.Timedelta(days=days)]
 
@@ -212,17 +232,34 @@ def page() -> None:
             with st.expander(f"{len(log.recent_errors)} error(s) in the last 24 hours"):
                 st.code("\n".join(log.recent_errors), language=None)
 
-    if mine:
+    if mine or logged:
         st.caption(f"{choice}: closed trades since 5 Oct")
-        st.dataframe(pd.DataFrame([{
+        rows_ = [{
             "Opened (UK)": t.opened.tz_convert(UK).strftime("%d %b %H:%M"),
             "Closed (UK)": t.closed.tz_convert(UK).strftime("%d %b %H:%M"),
             "Side": t.side, "Exit": t.exit, "Realised (IG)": t.realised, "Financing": t.financing,
-            "After costs": t.net, "Note": t.note,
-        } for t in sorted(mine, key=lambda t: t.closed, reverse=True)]), hide_index=True, width="stretch",
+            "After costs": t.net, "Note": t.note, "_at": t.closed,
+        } for t in mine] + [{
+            "Opened (UK)": c.opened.tz_convert(UK).strftime("%d %b %H:%M") if c.opened is not None else "",
+            "Closed (UK)": c.closed.tz_convert(UK).strftime("%d %b %H:%M"),
+            "Side": c.side, "Exit": c.exit, "Realised (IG)": None, "Financing": None, "After costs": c.net,
+            "Note": "provisional: from the close message - IG's history hasn't recorded it yet"
+                    + ("" if c.after_costs else " (before financing)"), "_at": c.closed,
+        } for c in logged]
+        table_ = pd.DataFrame(rows_).sort_values("_at", ascending=False).drop(columns="_at")
+        st.dataframe(table_, hide_index=True, width="stretch",
             column_config={k: st.column_config.NumberColumn(format="£%.2f")
                            for k in ("Realised (IG)", "Financing", "After costs")})
 
+    provisional = [(name, c) for name, v in views.items() for c in v[4]]
+    if provisional:
+        st.caption(f"Provisional: {len(provisional)} close(s) IG's transaction history hasn't recorded yet "
+                   f"({', '.join(f'{n} {money(c.net)}' for n, c in provisional)}), counted at the P&L their close "
+                   "message reported. IG's own figures replace them once its history catches up.")
+    if lone_legs:
+        days = sorted({t.opened.tz_convert(UK).strftime("%d %b") for t in lone_legs})
+        st.caption(f"Left out: {len(lone_legs)} one-leg trade(s) from entries IG half-refused ({', '.join(days)}), "
+                   f"{money(sum(t.net for t in lone_legs))} in all - the app unwound each one at once.")
     st.caption("Banked figures are IG's own (realised P&L plus financing and admin fees). Open trades are "
                "marked at mid prices from the pairs' 15-second price logs, so the line is an estimate until "
                "IG books the close. Read-only: this page never trades.")
