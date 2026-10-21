@@ -28,6 +28,26 @@ configured pairs:
   its API, so BP is polled over REST every 15s while Brent streams; entries
   are blocked on BP's ex-dividend days (`no_entry_dates` in its config)
 
+## Earnings-miss shorts (demo)
+
+`earnings_short/` is a separate strategy on the same IG account: short S&P 500 shares after their biggest
+earnings misses, each hedged with a US 500 long of the same exposure, held 19 sessions. A report counts
+as a miss when its EPS surprise over the share price before it is in the bottom 20% of the past year's
+S&P 500 reports (Jake's DB: `earnings_sp500`, `us_minute_paths`). It skips shares IG can't short and
+those whose IG minimum stake (£0.24 a cent) would be over twice the £3,000 notional
+(`config/earnings_short.toml`). launchd runs it each weekday afternoon (`./scripts/install_earnings_short.sh
+install`); it acts once per NYSE session, at about 15:45 New York, and keeps its book in
+`state/earnings_short/book.json`. `--dry-run [--as-of YYYY-MM-DD]` shows what it would do.
+
+A close message gives the short's and the hedge's P&L (IG's, after bid/offer), the short's funding and
+any dividend adjustment, and the net after them. IG books share funding once a night for all US shares
+together ("Short Interest for US/Can shares 20/10/26" received, "Stock Borrowing ..." paid), so each
+short gets its share by exposure (`oil_pair/costs.py`, which also does this for BP in `bp_brent`). The
+quarterly US 500 hedge has no overnight funding.
+
+Why demo: the backtest (2016-2026) made +25 to +170 bp a trade after IG's costs in every year since 2023,
+but was a coin toss in 2016-2022, so this tests whether it holds going forward.
+
 ## Dashboard
 
 `dashboard/app.py` is a read-only page with every pair's position, where its

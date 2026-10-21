@@ -14,14 +14,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
-import requests
-from dotenv import load_dotenv
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from oil_pair import jakefx_api  # noqa: E402
+
 PRINT_LIMIT = 20_000
 
 
@@ -34,16 +33,10 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=120)
     args = parser.parse_args()
 
-    load_dotenv(REPO_ROOT / ".env")
-    base, token = os.environ.get("JAKEFX_DB_URL"), os.environ.get("JAKEFX_DB_TOKEN")
-    if not base or not token:
-        sys.exit("JAKEFX_DB_URL and JAKEFX_DB_TOKEN must be set in .env")
-    url = base.rstrip("/") + "/" + args.path.lstrip("/")
-    headers = {"Authorization": f"Bearer {token}"}
-    if args.method == "get":
-        response = requests.get(url, headers=headers, timeout=args.timeout)
-    else:
-        response = requests.post(url, headers=headers, json=json.loads(args.json or "{}"), timeout=args.timeout)
+    try:
+        response = jakefx_api.request(args.method, args.path, json.loads(args.json or "{}"), timeout=args.timeout)
+    except RuntimeError as exc:
+        sys.exit(str(exc))
 
     print(f"HTTP {response.status_code} {response.headers.get('content-type', '')} {len(response.content)} bytes",
           file=sys.stderr)

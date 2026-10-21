@@ -1,0 +1,29 @@
+# Short S&P 500 earnings misses, hedged with the US 500 (earnings_short/). Demo unless run with --live.
+
+# Size: about this much exposure (£) per short. IG's minimum stake on US shares is £0.24 a cent, so a
+# share whose minimum alone would be more than max_min_stake_ratio x this (over ~$250 at £3,000) is skipped.
+notional_per_trade = 3000
+max_min_stake_ratio = 2.0
+
+# Limits on the book.
+max_new_per_day = 10
+max_open = 40
+
+# The rule, as backtested: a report whose surprise (actual - consensus EPS, over the close before it)
+# is in the bottom `quantile` of the past year's S&P 500 reports; short at the close of the session
+# after the report, held `hold_sessions` sessions.
+quantile = 0.2
+hold_sessions = 19
+
+# The hedge: a US 500 long of the same exposure, opened and closed with each short - on IG's quarterly
+# (futures-style) contract, which has no overnight funding: about 20 bp over a 19-session hold (its price
+# carries interest less dividends) against about 45 bp on the daily-funded one, whose long pays SOFR +
+# 3.4%. The front contract if it lasts past the short's exit, else the next; the daily-funded one only
+# if neither is open.
+hedge_epics = ["IX.D.SPTRD.MONTH1.IP", "IX.D.SPTRD.MONTH2.IP"]
+hedge_fallback_epic = "IX.D.SPTRD.DAILY.IP"
+
+# When to act (New York time), so a launchd job that fires a few times is safe: once per session,
+# just before the 16:00 close.
+window_start = "15:35"
+window_end = "15:58"
