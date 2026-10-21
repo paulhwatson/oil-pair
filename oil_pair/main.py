@@ -591,7 +591,11 @@ def _financing(
         if len(positions):
             positions = positions[~positions["dealId"].isin([leg.deal_id for leg, _ in legs])]
         others = costs.holdings(positions)
-        held = [costs.Holding(instrument.name, leg.size, costs.utc(state.opened_at)) for leg, instrument in legs]
+        held = [
+            costs.Holding(instrument.name, leg.size, costs.utc(state.opened_at), costs.share_group(instrument.epic),
+                          leg.size * (leg.open_level or 0.0))
+            for leg, instrument in legs
+        ]
         return trade_report.Financing(
             amount=sum(costs.overnight_share(transactions, h, others) for h in held),
             unbooked=any(costs.unbooked(transactions, h, now) for h in held),

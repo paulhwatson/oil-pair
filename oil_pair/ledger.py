@@ -182,17 +182,23 @@ def build_trades(
         trades.append(Trade(pair, account, g))
 
     others = list(open_positions)
+    groups_by_name = {name: costs.share_group(epic) for p in pairs for epic, name in p.epics.items()}
     exits = [e for e in log_events if e.what in ("take profit", "stop loss")]
     out = []
     for t in trades:
         financing = sum(
-            costs.overnight_share(transactions, costs.Holding(leg.name, abs(leg.size), leg.opened), others, until=leg.closed)
+            costs.overnight_share(transactions, _holding(leg, groups_by_name.get(leg.name)), others, until=leg.closed)
             for leg in t.legs
         )
         near = [e for e in exits if e.pair == t.pair and abs(e.at - t.closed) <= LOG_MATCH_WITHIN]
         exit_ = min(near, key=lambda e: abs(e.at - t.closed)).what if near else ""
         out.append(replace(t, financing=financing, exit=exit_))
     return out
+
+
+def _holding(leg: ClosedLeg, group: str | None) -> costs.Holding:
+    size = abs(leg.size)
+    return costs.Holding(leg.name, size, leg.opened, group, size * leg.open_level if group else 0.0)
 
 
 def _from_logs(g: tuple[ClosedLeg, ...], events: list[LogEvent]) -> str | None:

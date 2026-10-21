@@ -128,3 +128,77 @@ def test_paging_reads_every_page_of_the_history():
     t = costs.fetch_transactions(client, pd.Timestamp("2026-09-01", tz="UTC"))
 
     assert seen == [1, 2] and t.instrumentName.tolist() == ["a", "a", "b"]
+
+
+# --- shares: one funding row a night for all of a market's shares ---
+
+def share(name, exposure, opened, group=costs.US_SHARES, closed=None, size=0.24):
+    return Holding(name, size, pd.Timestamp(opened, tz="UTC"), group, exposure,
+                   pd.Timestamp(closed, tz="UTC") if closed else None)
+
+
+def funding_row(what, day, amount, group="US/Can shares ", booked=None):
+    kind = "DEPO" if not amount.startswith("£-") else "WITH"
+    booked = booked or pd.Timestamp(pd.to_datetime(day, format="%d/%m/%y") + pd.Timedelta(hours=28, minutes=30)).isoformat()
+    return (kind, f"{what} for {group}{day}", booked, booked, "-", amount)
+
+
+@pytest.mark.parametrize("epic, group", [
+    ("UD.D.STLD.DAILY.IP", costs.US_SHARES), ("UA.D.AAPL.DAILY.IP", costs.US_SHARES),
+    ("KA.D.BP.DAILY.IP", costs.UK_SHARES), ("KC.D.ASCL.DAILY.IP", costs.UK_SHARES),
+    ("CC.D.LCO.USS.IP", None), ("IX.D.SPTRD.MONTH1.IP", None),
+])
+def test_a_markets_share_group_comes_from_its_epic(epic, group):
+    assert costs.share_group(epic) == group
+
+
+def test_a_nights_share_funding_is_split_by_exposure_among_the_shares_held_that_night():
+    """2026-10-20: the STLD short (opened 19:40 UTC) was the only US share held that night - it gets
+    all of IG's two rows. Had a second short of twice the exposure been held too, it would get a third."""
+    stld = share("Steel Dynamics Inc", 5851.2, "2026-10-20T19:40:09")
+    t = tx([funding_row("Short Interest", "20/10/26", "£0.09"), funding_row("Stock Borrowing", "20/10/26", "£-0.13")])
+
+    assert costs.overnight_share(t, stld, []) == pytest.approx(-0.04)
+    other = share("Other Inc", 11702.4, "2026-10-15T19:40:00")
+    assert costs.overnight_share(t, stld, [other]) == pytest.approx(-0.04 / 3)
+
+
+def test_share_funding_counts_only_nights_held_and_only_its_own_market():
+    stld = share("Steel Dynamics Inc", 5851.2, "2026-10-20T19:40:09")
+    t = tx([funding_row("Short Interest", "19/10/26", "£0.09"),              # before it opened
+            funding_row("Short Interest", "21/10/26", "£0.09"),
+            funding_row("Short Interest", "22/10/26", "£0.09"),              # after it closed
+            funding_row("Stock Borrowing", "21/10/26", "£-0.06", group="")])  # UK shares': BP's
+    closed = pd.Timestamp("2026-10-22T19:45", tz="UTC")
+
+    assert costs.overnight_share(t, stld, [], until=closed) == pytest.approx(0.09)
+    bp = share("BP PLC", 2487.17, "2026-10-19T07:00:47", group=costs.UK_SHARES, size=4.02)
+    assert costs.overnight_share(t, bp, []) == pytest.approx(-0.06)
+
+
+def test_a_share_since_closed_shares_the_nights_it_was_held():
+    stld = share("Steel Dynamics Inc", 6000, "2026-10-20T19:40:09")
+    gone = share("Gone Inc", 6000, "2026-10-01T19:40:00", closed="2026-10-21T19:45:00")
+    t = tx([funding_row("Stock Borrowing", "20/10/26", "£-0.20"), funding_row("Stock Borrowing", "21/10/26", "£-0.10")])
+
+    assert costs.overnight_share(t, stld, [gone]) == pytest.approx(-0.10 - 0.10)
+
+
+def test_a_dividend_adjustment_naming_the_share_counts_against_it():
+    bp = share("BP PLC", 2487.17, "2026-11-10T07:00:00", group=costs.UK_SHARES, size=4.02)
+    t = tx([("WITH", "Dividend Adjustment BP PLC", "2026-11-12T06:10:00", "2026-11-12T06:10:00", "-", "£-24.12"),
+            ("WITH", "Dividend Adjustment Shell PLC", "2026-11-12T06:10:00", "2026-11-12T06:10:00", "-", "£-9.00")])
+
+    assert costs.overnight_share(t, bp, []) == pytest.approx(-24.12)
+    stld = share("Steel Dynamics Inc (24 Hours)", 5851.2, "2026-10-20T19:40:09")      # IG's name for it
+    t = tx([("WITH", "Dividend Adjustment Steel Dynamics Inc", "2026-12-31T06:10:00", "2026-12-31T06:10:00", "-", "£-1.20")])
+    assert costs.overnight_share(t, stld, []) == pytest.approx(-1.20)
+
+
+def test_a_shares_last_night_unbooked_until_its_row_arrives():
+    stld = share("Steel Dynamics Inc", 5851.2, "2026-10-20T19:40:09")
+    morning = pd.Timestamp("2026-10-21T03:00", tz="UTC")                     # IG books it about 04:30 UTC
+    assert costs.unbooked(tx([]), stld, morning)
+    assert not costs.unbooked(tx([funding_row("Short Interest", "20/10/26", "£0.09")]), stld, morning)
+    sunday = pd.Timestamp("2026-10-25T12:00", tz="UTC")                      # the last weekday night: Friday's
+    assert not costs.unbooked(tx([funding_row("Short Interest", "23/10/26", "£0.09")]), stld, sunday)

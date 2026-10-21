@@ -193,7 +193,7 @@ def gather(dry_run: bool) -> tuple[list[PairStatus], list[str]]:
     for pair, account, state, cfg, legs in statuses:
         pos, fin, unbooked = positions[account], 0.0, False
         for leg in legs:
-            held = costs.Holding(leg.name, leg.size, leg.opened)
+            held = costs.Holding(leg.name, leg.size, leg.opened, costs.share_group(leg.epic), leg.size * leg.open_level)
             others = costs.holdings(pos[pos.dealId != leg.deal_id])
             fin += costs.overnight_share(transactions[account], held, others)
             unbooked = unbooked or costs.unbooked(transactions[account], held, now)
