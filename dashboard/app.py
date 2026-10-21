@@ -1,4 +1,5 @@
-"""oil-pair dashboard: every pair's position, spread and running profitability.
+"""oil-pair dashboard: every pair's position, spread and running profitability,
+and the earnings-miss shorts.
 
     ./.venv/bin/streamlit run dashboard/app.py
 
@@ -47,26 +48,33 @@ def _env():
 
 
 @st.cache_data(ttl=IG_REFRESH_SECONDS, show_spinner="Reading IG...")
-def ig_figures() -> tuple[list, dict, pd.Timestamp]:
-    """Closed trades since 5 Oct and open positions, from IG."""
+def ig_figures() -> tuple[list, dict, pd.Timestamp, pd.DataFrame, pd.DataFrame]:
+    """Closed trades since 5 Oct, the pairs' open positions, and IG's open
+    positions and transaction history (for the earnings shorts), from IG."""
     _env()
     import pair_status
-    from oil_pair import ledger
+    from oil_pair import costs, ledger
     from oil_pair.ig_client import IGClient
     from oil_pair.settings import load_credentials
     client = IGClient(load_credentials(live=False))
     client.login()
     pairs = ledger.load_pairs(ROOT / "config")
-    trades = [t for t in ledger.ig_closed_trades(client, pairs, ROOT / "logs", HISTORY_START)
+    positions = client.fetch_open_positions()
+    transactions = costs.fetch_transactions(client, HISTORY_START)
+    trades = [t for t in ledger.build_trades(transactions, pairs, "demo", ledger.read_pair_logs(pairs, ROOT / "logs"),
+                                             costs.holdings(positions))
               if t.opened >= TRADES_FROM]
     statuses, _ = pair_status.gather(dry_run=True)
-    return trades, {s.name: s for s in statuses}, pd.Timestamp.now(tz="UTC")
+    return trades, {s.name: s for s in statuses}, pd.Timestamp.now(tz="UTC"), positions, transactions
 
 
-def split_lone_legs(trades: list) -> tuple[list, list]:
+def split_lone_legs(trades: list, pair_markets: set[str]) -> tuple[list, list]:
     """(pair trades, lone legs). A lone leg is one market traded alone - an
     entry IG half-refused, unwound at once. Left out of every figure here so
-    they don't distort the pairs' statistics; listed in the footer instead."""
+    they don't distort the pairs' statistics; listed in the footer instead.
+    Deals in markets no pair trades - the earnings shorts and their hedges -
+    are left out of both: they have their own section."""
+    trades = [t for t in trades if set(t.markets) <= pair_markets]
     return [t for t in trades if len(t.markets) == 2], [t for t in trades if len(t.markets) != 2]
 
 
@@ -92,15 +100,16 @@ def ago(ts: pd.Timestamp | None, now: pd.Timestamp) -> str:
 def page() -> None:
     now = pd.Timestamp.now(tz="UTC")
     try:
-        trades, statuses, ig_at = ig_figures()
+        trades, statuses, ig_at, positions, transactions = ig_figures()
     except Exception as exc:  # noqa: BLE001 - show the page with what's local
         st.error(f"Couldn't read IG just now ({exc}) - showing local figures only.")
-        trades, statuses, ig_at = [], {}, None
+        trades, statuses, ig_at, positions, transactions = [], {}, None, pd.DataFrame(), None
     ig_trades = trades
-    trades, lone_legs = split_lone_legs(trades)
 
     start = TRADES_FROM.tz_convert("UTC")
     pairs = {p.parent.name: load_pair_config(p) for p in sorted((ROOT / "config").glob("*/pair_config.toml"))}
+    pair_markets = {i.name for cfg in pairs.values() for i in (cfg.instrument_a, cfg.instrument_b)}
+    trades, lone_legs = split_lone_legs(trades, pair_markets)
 
     rows, curves, views = [], {}, {}
     for name, cfg in pairs.items():
@@ -178,6 +187,8 @@ def page() -> None:
     fig.update_layout(height=420, yaxis_title="£ after costs (open trades at mid)", hovermode="x unified",
                       margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
     st.plotly_chart(fig, width="stretch")
+
+    earnings_shorts(positions, transactions, ig_at, now)
 
     # --- one pair in detail ---
     st.subheader("Pair detail")
@@ -263,6 +274,47 @@ def page() -> None:
     st.caption("Banked figures are IG's own (realised P&L plus financing and admin fees). Open trades are "
                "marked at mid prices from the pairs' 15-second price logs, so the line is an estimate until "
                "IG books the close. Read-only: this page never trades.")
+
+
+def earnings_shorts(positions: pd.DataFrame, transactions, ig_at, now: pd.Timestamp) -> None:
+    """The earnings-miss shorts: a separate strategy, kept out of the pairs' figures above."""
+    from earnings_short import book as book_store
+
+    st.subheader("Earnings-miss shorts")
+    try:
+        book = book_store.load(ROOT / "state" / "earnings_short" / "book.json", "demo")
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Couldn't read the earnings shorts' book ({exc}).")
+        return
+    run = figures.last_short_run(ROOT / "logs" / "earnings_short" / "oil_pair.log")
+    opened = figures.open_shorts(book, positions, transactions, ig_at or now) if ig_at is not None else pd.DataFrame()
+    closed = figures.closed_shorts(book)
+    open_net = opened["Net"].sum() if len(opened) else 0.0
+    banked = closed["Net"].fillna(0).sum() if len(closed) else 0.0
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Open shorts", f"{len(book.positions)}")
+    c2.metric("Open P&L at mid", money(open_net) if ig_at is not None else "n/a")
+    c3.metric("Banked", money(banked))
+    c4.metric("Closed", f"{len(closed)}")
+    if run:
+        st.caption(f"Last run {run[0].tz_convert(UK):%a %d %b %H:%M} UK: {run[1]}.")
+    if len(opened):
+        st.dataframe(opened, hide_index=True, width="stretch", column_config={
+            "Surprise (bp)": st.column_config.NumberColumn(format="%+.1f"),
+            "Now (mid)": st.column_config.NumberColumn(format="%.2f"),
+            "IG spread now": st.column_config.NumberColumn(format="percent"),
+            **{k: st.column_config.NumberColumn(format="£%.2f")
+               for k in ("Exposure", "Share P&L", "Hedge P&L", "Funding", "Net")},
+        })
+    elif ig_at is None and book.positions:
+        st.write(", ".join(f"{p.symbol} short since {p.opened[:10]}" for p in book.positions))
+    if len(closed):
+        st.dataframe(closed, hide_index=True, width="stretch", column_config={
+            k: st.column_config.NumberColumn(format="£%.2f") for k in ("Share P&L", "Hedge P&L", "Funding", "Net")})
+    st.caption("Each short is hedged with a US 500 long of the same exposure and closed 19 sessions on. Open "
+               "P&L is at IG's mid prices. Out of US hours IG's share quotes are wide, so closing then would "
+               "cost far more than the close at about 15:45 New York will. Funding is IG's nightly short "
+               "interest less stock borrowing, shared by exposure, plus any dividend adjustment.")
 
 
 page()

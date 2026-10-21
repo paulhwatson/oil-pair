@@ -11,6 +11,10 @@ IG, every few minutes (it is one request budget all the pairs share):
   closed trades with their financing (oil_pair.ledger, as the spreadsheet)
   open positions with P&L after costs (scripts/pair_status.py)
 
+The earnings-miss shorts (earnings_short/) come from their book
+(state/earnings_short/book.json), IG's open positions and its transaction
+history for their funding, and their log for the last run.
+
 A pair's running profitability is its banked P&L after costs (IG's
 figures, stepping up or down as each trade closes) plus the open trade
 marked to market at mid prices - an estimate until IG books the close.
@@ -20,7 +24,7 @@ from __future__ import annotations
 
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pandas as pd
@@ -156,3 +160,69 @@ def _mark(marks: pd.DataFrame, epic: str | None, size: float, open_level: float)
 def is_running(pair: str) -> bool:
     found = subprocess.run(["pgrep", "-f", f"oil_pair.main {pair}$"], capture_output=True, text=True)
     return found.returncode == 0
+
+
+# --- the earnings-miss shorts ---
+
+_ES_RUN = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ INFO earnings_short: (\d+ report.*)$")
+
+
+def last_short_run(path: Path) -> tuple[pd.Timestamp, str] | None:
+    """(when, what) of the strategy's last run that got as far as the day's reports."""
+    if not path.exists():
+        return None
+    found = None
+    for line in path.read_text(errors="replace").splitlines():
+        if m := _ES_RUN.match(line):
+            found = m
+    if found is None:
+        return None
+    return pd.Timestamp(found.group(1)).tz_localize(UK).tz_convert("UTC"), found.group(2)
+
+
+def open_shorts(book, positions: pd.DataFrame, transactions: pd.DataFrame | None, now: pd.Timestamp) -> pd.DataFrame:
+    """Each open short with its hedge, marked at IG's mid prices now, and its funding so far."""
+    from earnings_short import main as es
+
+    by_deal = positions.set_index("dealId") if len(positions) and "dealId" in positions else pd.DataFrame()
+    outside = es.outside_holdings(book, positions)
+    rows = []
+    for p in book.positions:
+        share = by_deal.loc[p.deal_id] if p.deal_id in by_deal.index else None
+        hedge = by_deal.loc[p.hedge_deal_id] if p.hedge_deal_id in by_deal.index else None
+        if share is not None and p.name is None:
+            p = replace(p, name=str(share.instrumentName))
+        mid = (float(share.bid) + float(share.offer)) / 2 if share is not None else None
+        share_pnl = p.size * (p.entry_level - mid) if mid is not None and p.entry_level else None
+        hedge_mid = (float(hedge.bid) + float(hedge.offer)) / 2 if hedge is not None else None
+        hedge_pnl = p.hedge_size * (hedge_mid - p.hedge_level) if hedge_mid is not None and p.hedge_level else None
+        f = es.funding(book, p, transactions, outside, now) if transactions is not None else None
+        net = (share_pnl or 0.0) + (hedge_pnl or 0.0) + (f.total if f else 0.0)
+        rows.append({
+            "Share": p.symbol, "Opened (UK)": pd.Timestamp(p.opened).tz_convert(UK).strftime("%d %b %H:%M"),
+            "Report": pd.Timestamp(p.report_date).strftime("%d %b"), "Surprise (bp)": p.surprise * 1e4,
+            "Short": f"£{p.size:.2f}/pt at {p.entry_level / 100:,.2f}" if p.entry_level else f"£{p.size:.2f}/pt",
+            "Exposure": p.exposure, "Now (mid)": mid / 100 if mid is not None else None,
+            "IG spread now": (float(share.offer) - float(share.bid)) / mid if mid else None,
+            "Share P&L": share_pnl,
+            "Hedge": f"US 500 {p.hedge_expiry} £{p.hedge_size:.2f}/pt" if p.hedge_deal_id else "UNHEDGED",
+            "Hedge P&L": hedge_pnl, "Funding": f.total if f else None, "Net": net,
+            "Closes": pd.Timestamp(p.exit_session).strftime("%a %d %b"),
+            "On IG": "yes" if share is not None and (hedge is not None or not p.hedge_deal_id) else "MISSING",
+        })
+    return pd.DataFrame(rows)
+
+
+def closed_shorts(book) -> pd.DataFrame:
+    """The book's closed shorts, newest first, as their close messages reported them."""
+    rows = [{
+        "Share": c["symbol"], "Opened (UK)": pd.Timestamp(c["opened"]).tz_convert(UK).strftime("%d %b"),
+        "Closed (UK)": pd.Timestamp(c["closed"]).tz_convert(UK).strftime("%d %b %H:%M"),
+        "Share P&L": c.get("share_pnl"), "Hedge P&L": c.get("hedge_pnl"),
+        "Funding": (c.get("funding") or 0.0) + (c.get("dividends") or 0.0) if c.get("funding") is not None else None,
+        "Net": c.get("net"), "Note": "closed outside the app" if c.get("outside_the_app") else "",
+        "_at": pd.Timestamp(c["closed"]),
+    } for c in book.closed if c.get("closed")]
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("_at", ascending=False).drop(columns="_at")

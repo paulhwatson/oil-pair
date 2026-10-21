@@ -53,7 +53,8 @@ but was a coin toss in 2016-2022, so this tests whether it holds going forward.
 `dashboard/app.py` is a read-only page with every pair's position, where its
 spread sits against its entry, take-profit and stop, and its running
 profitability since 5 Oct (IG's banked figures plus open trades marked at
-mid). launchd keeps it running at http://localhost:8501
+mid), and the earnings-miss shorts in a section of their own (kept out of
+the pairs' figures). launchd keeps it running at http://localhost:8501
 (`./scripts/install_dashboard.sh install`; `install --phone` also serves it
 to your home network).
 

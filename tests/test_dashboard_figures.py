@@ -117,3 +117,55 @@ def test_a_logged_close_of_a_trade_opened_before_the_cut_off_is_left_out():
     early = figures.LoggedClose(pd.Timestamp("2026-10-02T13:00", tz=UTC), pd.Timestamp("2026-10-06T12:09", tz=UTC),
                                 "LONG", "take profit", -7.24, False)
     assert figures.not_yet_in_ig((early,), [], pd.Timestamp("2026-10-05", tz=UTC)) == []
+
+
+# --- the earnings-miss shorts ---
+
+def short_book():
+    from earnings_short import book as book_store
+    stld = book_store.Position(
+        "STLD", "UD.D.STLD.DAILY.IP", "S1", 0.24, 24350.0, 5844.0, "2026-10-20T19:40:09+00:00", "2026-11-16",
+        "2026-10-19", -9.1e-4, 0.7e-4, "H1", 0.76, 7748.36, "IX.D.SPTRD.MONTH1.IP", "DEC-26")
+    return book_store.Book("demo", [stld], [{
+        "symbol": "BAC", "opened": "2026-09-15T19:40:00+00:00", "closed": "2026-10-12T19:45:00+00:00",
+        "share_pnl": 30.0, "hedge_pnl": -12.0, "funding": -0.5, "dividends": -1.0, "net": 16.5}])
+
+
+def test_open_shorts_are_marked_at_mid_with_their_hedge_and_funding():
+    positions = pd.DataFrame({
+        "dealId": ["S1", "H1"], "epic": ["UD.D.STLD.DAILY.IP", "IX.D.SPTRD.MONTH1.IP"],
+        "instrumentName": ["Steel Dynamics Inc (24 Hours)", "US 500"], "size": [0.24, 0.76],
+        "level": [24350.0, 7748.36], "bid": [23989.0, 7774.73], "offer": [26711.0, 7775.73],
+        "createdDateUTC": ["2026-10-20T19:40:09", "2026-10-20T19:40:09"]})
+    history = pd.DataFrame([
+        {"transactionType": "DEPO", "instrumentName": "Short Interest for US/Can shares 20/10/26",
+         "dateUtc": "2026-10-21T04:30:56", "openDateUtc": "2026-10-21T04:30:56", "size": "-", "profitAndLoss": "£0.09"},
+        {"transactionType": "WITH", "instrumentName": "Stock Borrowing for US/Can shares 20/10/26",
+         "dateUtc": "2026-10-21T04:30:56", "openDateUtc": "2026-10-21T04:30:56", "size": "-", "profitAndLoss": "£-0.13"}])
+
+    (row,) = figures.open_shorts(short_book(), positions, history, pd.Timestamp("2026-10-21T12:00", tz=UTC)).to_dict("records")
+
+    assert row["Share P&L"] == pytest.approx(0.24 * (24350 - 25350))           # mid 25,350: -£240
+    assert row["Hedge P&L"] == pytest.approx(0.76 * (7775.23 - 7748.36))
+    assert row["Funding"] == pytest.approx(-0.04)
+    assert row["Net"] == pytest.approx(row["Share P&L"] + row["Hedge P&L"] - 0.04)
+    assert row["IG spread now"] == pytest.approx(2722 / 25350)
+    assert row["On IG"] == "yes" and row["Closes"] == "Mon 16 Nov"
+
+
+def test_a_short_missing_from_ig_is_flagged():
+    (row,) = figures.open_shorts(short_book(), pd.DataFrame({"dealId": []}), None,
+                                 pd.Timestamp("2026-10-21T12:00", tz=UTC)).to_dict("records")
+    assert row["On IG"] == "MISSING" and row["Funding"] is None
+
+
+def test_closed_shorts_and_the_last_run(tmp_path):
+    (row,) = figures.closed_shorts(short_book()).to_dict("records")
+    assert row["Share"] == "BAC" and row["Funding"] == pytest.approx(-1.5) and row["Net"] == pytest.approx(16.5)
+
+    log = tmp_path / "oil_pair.log"
+    log.write_text("2026-10-19 20:40:07,921 INFO earnings_short: 5 report(s) from Fri 16 Oct, 0 miss(es)\n"
+                   "2026-10-20 20:40:11,323 INFO earnings_short: 3 report(s) from Mon 19 Oct, 1 miss(es); opened 1\n"
+                   "2026-10-20 20:40:11,324 INFO earnings_short:   Shorted STLD\n")
+    at, what = figures.last_short_run(log)
+    assert at == pd.Timestamp("2026-10-20T19:40:11", tz=UTC) and what.endswith("opened 1")

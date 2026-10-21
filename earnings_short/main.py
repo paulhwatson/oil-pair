@@ -166,13 +166,21 @@ def funding(book: book_store.Book, p: book_store.Position, transactions: pd.Data
     share funding is shared among the US shares held that night: the book's shorts, open and closed,
     and `outside` - any other US share open on the account."""
     me = replace(_share(p.symbol, p.name, p.exposure, p.opened), size=p.size)
-    others = [_share(q.symbol, q.name, q.exposure, q.opened) for q in book.positions if q is not p]
+    others = [_share(q.symbol, q.name, q.exposure, q.opened) for q in book.positions if q.deal_id != p.deal_id]
     others += [_share(c["symbol"], c.get("name"), c.get("exposure"), c["opened"], c["closed"])
                for c in book.closed if c.get("exposure") and c.get("closed")]
     others += outside
     total = costs.overnight_share(transactions, me, others, until=closed_at)
     dividends = costs.overnight_share(transactions, replace(me, group=None), others, until=closed_at)
     return Funding(total - dividends, dividends, costs.unbooked(transactions, me, closed_at))
+
+
+def outside_holdings(book: book_store.Book, open_now: pd.DataFrame | None) -> list[costs.Holding]:
+    """US shares open on the account that aren't the book's: they share each night's funding too."""
+    if open_now is None or "dealId" not in open_now:
+        return []
+    ours = {q.deal_id for q in book.positions} | {q.hedge_deal_id for q in book.positions}
+    return [h for h in costs.holdings(open_now[~open_now["dealId"].isin(ours)]) if h.group == costs.US_SHARES]
 
 
 def _transactions(client: IGClient, since: pd.Timestamp) -> pd.DataFrame | None:
@@ -204,9 +212,7 @@ def close_due(book: book_store.Book, client: IGClient, now: pd.Timestamp, lines:
     if not due:
         return 0.0
     transactions = _transactions(client, min(costs.utc(p.opened) for p in due))
-    ours = {q.deal_id for q in book.positions} | {q.hedge_deal_id for q in book.positions}
-    outside = [] if open_now is None or "dealId" not in open_now else [
-        h for h in costs.holdings(open_now[~open_now["dealId"].isin(ours)]) if h.group == costs.US_SHARES]
+    outside = outside_holdings(book, open_now)
     total = 0.0
     for p in due:
         confirm = client.close_market_position(p.deal_id, "BUY", p.size, p.epic)
@@ -360,7 +366,7 @@ def run(live: bool = False, dry_run: bool = False, force: bool = False, now: pd.
 
     summary = (f"{n_reports} report(s) from {sessions.previous_session(today):%a %d %b}, {len(cands)} miss(es) "
                f"at or below {cut * 1e4:+.1f} bp of price" if cut is not None else f"{n_reports} report(s)")
-    log.info("%s; opened %d; %d open", summary, opened, len(book.positions))
+    log.info("%s%s; opened %d; %d open", "DRY RUN: " if dry_run else "", summary, opened, len(book.positions))
     for line in lines:
         log.info("  %s", line)
     if dry_run:
