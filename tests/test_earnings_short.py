@@ -1,7 +1,9 @@
+import numpy as np
 import pandas as pd
 import pytest
 
 from earnings_short import book as book_store
+from earnings_short import ib
 from earnings_short import main as es
 from earnings_short import sessions, signals
 
@@ -31,8 +33,12 @@ def test_session_arithmetic_skips_weekends_and_holidays():
 
 # --- the rule ---
 
+COLUMNS = ["symbol", "report_date", "eps_actual", "eps_estimated", "prev_close", "revenue_actual", "revenue_estimated"]
+
+
 def reports(rows):
-    return pd.DataFrame(rows, columns=["symbol", "report_date", "eps_actual", "eps_estimated", "prev_close"])
+    """Rows of (symbol, date, eps actual, eps estimate, prev close[, revenue actual, revenue estimate])."""
+    return pd.DataFrame([tuple(r) + (None,) * (len(COLUMNS) - len(r)) for r in rows], columns=COLUMNS)
 
 
 def test_the_threshold_is_the_quantile_of_the_past_years_surprises():
@@ -48,6 +54,33 @@ def test_candidates_are_the_misses_at_or_below_the_cut_worst_first():
     picked = signals.candidates(r, cut=0.7e-4)
     assert [c.symbol for c in picked] == ["BAC", "STT"]
     assert picked[0].surprise == pytest.approx((1.08 - 1.10) / 53.945)
+
+
+def test_what_backs_up_a_miss():
+    hist = reports([("X", "2026-01-01", 1.0, 1.0, 100.0, 100 + i / 5, 100.0) for i in range(-25, 25)] * 5)  # -5%..+5%
+    rev_cut = signals.revenue_threshold(hist, 0.2)
+    assert rev_cut == pytest.approx(pd.Series([i / 500 for i in range(-25, 25)] * 5).quantile(0.2))
+    assert signals.revenue_threshold(hist.head(150), 0.2) is None
+
+    earlier = reports([("BAC", "2026-07-15", 0.80, 0.85, 45.0), ("STT", "2026-01-10", 2.0, 2.5, 100.0),
+                       ("STT", "2026-07-15", 2.6, 2.5, 100.0)])
+    earlier["report_date"] = pd.to_datetime(earlier.report_date)
+    now = reports([("BAC", "2026-10-14", 1.08, 1.10, 53.945, 26.0e9, 27.5e9),     # revenue -5.5%
+                   ("STT", "2026-10-14", 3.60, 3.68, 173.96, 3.5e9, 3.4e9),       # revenue beat
+                   ("XYZ", "2026-10-14", 1.00, 1.10, 50.0)])                      # no revenue, no history
+    now["report_date"] = pd.to_datetime(now.report_date)
+    bac, stt, xyz = sorted(signals.candidates(now, 0.7e-4, rev_cut, earlier), key=lambda c: c.symbol)
+    assert bac.previous_missed is True and stt.previous_missed is False and xyz.previous_missed is None
+
+    assert signals.confirmations(bac, None, -0.037) == ["revenue -5.5% on consensus", "last report missed too"]
+    assert signals.confirmations(stt, None, -0.037) == []
+    down = signals.reaction(48.0, 50.0, 101.0, 100.0)                            # -4.1% less +1.0%
+    assert down == pytest.approx(np.log(0.96) - np.log(1.01))
+    assert signals.confirmations(stt, down, -0.037) == ["shares -5.0% on the market"]
+    assert signals.confirmations(stt, signals.reaction(49.0, 50.0, 100.0, 100.0), -0.037) == []   # -2% isn't enough
+    assert signals.reaction(4900.0, 50.0, 100.0, 100.0) is None                  # cents against dollars
+    assert signals.describe(stt, None) == "revenue +2.9% (cut -3.0%), move n/a, last report beat or met"
+    assert signals.describe(xyz, None).startswith("revenue n/a")
 
 
 def test_stake_meets_igs_minimum_or_skips_a_share_too_dear_for_it():
@@ -117,15 +150,21 @@ class FakeIG:
 def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(es, "STATE", tmp_path / "book.json")
     monkeypatch.setattr(es, "PAUSE_BETWEEN_DEALS", 0)
-    # 250 past surprises from -1 to +1.5 bp of price: the 20% cut is about -0.5 bp
-    hist = reports([("H", "2026-01-01", i / 10000, 0.0, 100.0) for i in range(-100, 150)])
-    today_reports = reports([("BAC", "2026-10-14", 1.08, 1.10, 53.945), ("PGR", "2026-10-14", 4.66, 4.35, 222.85)])
+    # 250 past surprises from -1 to +1.5 bp of price: the 20% cut is about -0.5 bp; revenue surprises from
+    # -5% to +5%: its 20% cut is -3%
+    hist = reports([("H", "2026-01-01", i / 10000, 0.0, 100.0, 100 + (i % 50 - 25) / 5, 100.0) for i in range(-100, 150)])
+    hist["report_date"] = pd.to_datetime(hist.report_date)
+    # BAC missed on EPS, and on revenue by 5.5% - which backs up the miss
+    today_reports = reports([("BAC", "2026-10-14", 1.08, 1.10, 53.945, 26.0e9, 27.5e9),
+                             ("PGR", "2026-10-14", 4.66, 4.35, 222.85, 20e9, 19e9)])
     today_reports["report_date"] = pd.to_datetime(today_reports.report_date)
+    today_reports["prev_day"] = pd.Timestamp("2026-10-13")
 
     def fake_reports(start, end):
         return today_reports if end > pd.Timestamp("2026-10-14") else hist
 
     monkeypatch.setattr(es.data, "reports", fake_reports)
+    monkeypatch.setattr(es.data, "closes", lambda symbol, days: pd.Series({pd.Timestamp("2026-10-13"): 53.945}))
     monkeypatch.setattr(es.data, "ig_terms", lambda symbols: pd.DataFrame(
         {"symbol": ["BAC"], "epic": ["UC.D.BAC.DAILY.IP"], "unborrowable": [False]}))
     sent = []
@@ -153,6 +192,29 @@ def test_a_miss_is_shorted_and_hedged_and_booked(harness):
     assert p.exit_session == "2026-11-11"                     # 19 sessions on
     assert b.last_session == "2026-10-15"
     assert sent and sent[0][0].startswith("Earnings shorts: 1 opened")
+    assert p.confirmations == ["revenue -5.5% on consensus"]
+    assert "backed by revenue -5.5% on consensus" in sent[0][1]
+
+
+def test_a_miss_nothing_backs_up_is_skipped(harness, monkeypatch):
+    fake, sent, path = harness
+    today = es.data.reports(None, pd.Timestamp("2026-10-15"))
+    today.loc[today.symbol == "BAC", "revenue_actual"] = 27.6e9               # revenue beat
+    es.run(now=WED_1545)                                                      # and SPY flat, as is BAC
+    assert not [o for o in fake.opened if o[1] == "SELL"]
+    assert "BAC: skipped - nothing backs up the miss (revenue +0.4% (cut -3.0%), shares +0.0% on the market, " \
+           "no recent report)" in sent[0][1]
+
+
+def test_a_miss_the_market_has_marked_down_is_shorted(harness, monkeypatch):
+    fake, sent, path = harness
+    today = es.data.reports(None, pd.Timestamp("2026-10-15"))
+    today.loc[today.symbol == "BAC", "revenue_actual"] = 27.6e9               # revenue beat, but...
+    monkeypatch.setattr(es.data, "closes", lambda symbol, days: pd.Series({pd.Timestamp("2026-10-13"): 50.0}))
+    es.run(now=WED_1545)                                                      # SPY +7.9% while BAC is flat
+    (p,) = book_store.load(path, "demo").positions
+    assert p.symbol == "BAC" and p.confirmations == ["shares -7.3% on the market"]
+    assert p.reaction == pytest.approx(-np.log(53.945 / 50.0))
 
 
 def test_outside_the_window_or_after_todays_run_nothing_happens(harness):
@@ -210,6 +272,30 @@ def test_a_close_is_reported_after_the_shorts_funding_and_dividends(harness, mon
     assert ("Closed BAC short (15 Oct to 11 Nov): share +£25.00, hedge -£10.00, funding -£0.08, "
             "dividends -£1.50, net +£13.42 after costs") in sent[-1][1]
     assert sent[-1][0].endswith("(+£13.42)")
+
+    # the mids at both ends are kept, for the dashboard's IB estimate
+    assert (closed["entry_mid"], closed["exit_mid"]) == (5394.5, 5394.5)
+    assert (closed["hedge_entry_mid"], closed["hedge_exit_mid"]) == (7700.0, 7700.0)
+    assert closed["size"] == 0.56 and closed["hedge_size"] == 0.39
+
+
+def test_the_ib_estimate():
+    """£1/pt short of a $100 share that falls to $90 over a year, hedged with £1/pt of the US 500 rising
+    5,000 -> 5,100, paying a £2 dividend."""
+    costs = ib.IBCosts(commission_per_share=0.005, min_commission=0.40, borrow_rate=0.003, interest_rate=0.039)
+    got = ib.estimate(costs, size=1.0, entry_mid=10_000, exit_mid=9_000, opened=pd.Timestamp("2026-01-01", tz="UTC"),
+                      until=pd.Timestamp("2027-01-01", tz="UTC"), hedge_size=1.0, hedge_entry_mid=5_000,
+                      hedge_exit_mid=5_100, dividends=-2.0)
+    share = 1_000 - 0.003 * 10_000 - 2 * max(0.40, 0.005 * 10_000 / 100)       # 100 shares: £0.50 an order
+    hedge = 100 + 0.039 * 5_000 - 2 * 0.40                                     # SPY at $500: the minimum
+    assert got == pytest.approx(share + hedge - 2.0)
+    unhedged = ib.estimate(costs, size=1.0, entry_mid=10_000, exit_mid=9_000, opened=pd.Timestamp("2026-01-01", tz="UTC"),
+                           until=pd.Timestamp("2027-01-01", tz="UTC"))
+    assert unhedged == pytest.approx(share)
+
+
+def test_the_ib_rates_come_from_the_config():
+    assert es.load_config().ib.borrow_rate == pytest.approx(0.003)
 
 
 def test_a_close_without_igs_history_says_its_before_funding(harness):

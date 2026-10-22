@@ -12,6 +12,10 @@ the app); close every short whose exit session has come, with its hedge; then sh
 previous session that missed, each with a US 500 long of the same exposure. Every deal is checked for
 IG's acceptance, and the book is saved after each, so a crash never loses track of a position.
 
+A miss is shorted only when something backs it up (earnings_short/signals.py): revenue also among the
+past year's worst, the shares down on the market by the entry (IG's quote against SPY's, from the close
+before the report), or the company's previous report a miss too.
+
 A close is reported after costs: IG's realised P&L on the share and the hedge (after bid/offer), plus
 the short's funding - IG books one row a night for all US shares, short interest received and stock
 borrowing paid, shared out among the book's shorts by exposure (oil_pair.costs) - and any dividend
@@ -24,13 +28,14 @@ import argparse
 import logging
 import time
 import tomllib
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import pandas as pd
 
 from earnings_short import book as book_store
 from earnings_short import data, sessions, signals
+from earnings_short.ib import IBCosts
 from oil_pair import costs, instance_lock
 from oil_pair.ig_client import IGClient, deal_accepted, describe_rejection
 from oil_pair.logging_setup import configure_logging
@@ -58,10 +63,19 @@ class Config:
     hedge_fallback_epic: str
     window_start: str
     window_end: str
+    min_confirmations: int = 1
+    revenue_quantile: float = 0.2
+    max_reaction: float = -0.037
+    repeat_within_days: int = 150
+    market_symbol: str = "SPY"
+    market_epic: str = "SI.D.SPY.DAILY.IP"
+    ib: IBCosts = IBCosts()   # not for trading: the dashboard's IB estimate
 
 
 def load_config(path: Path = CONFIG) -> Config:
-    return Config(**tomllib.loads(path.read_text()))
+    raw = tomllib.loads(path.read_text())
+    ib = IBCosts(**raw.pop("ib", {}))
+    return Config(**raw, ib=ib)
 
 
 def in_window(now_ny: pd.Timestamp, cfg: Config) -> bool:
@@ -215,6 +229,7 @@ def close_due(book: book_store.Book, client: IGClient, now: pd.Timestamp, lines:
     outside = outside_holdings(book, open_now)
     total = 0.0
     for p in due:
+        exit_mid, hedge_exit_mid = _quote(client, p.epic), _quote(client, p.hedge_epic if p.hedge_deal_id else None)
         confirm = client.close_market_position(p.deal_id, "BUY", p.size, p.epic)
         if not deal_accepted(confirm):
             lines.append(f"{p.symbol}: close REFUSED ({describe_rejection(confirm)}) - still short, will retry")
@@ -237,8 +252,8 @@ def close_due(book: book_store.Book, client: IGClient, now: pd.Timestamp, lines:
         held = f"{costs.utc(p.opened).tz_convert(NY):%d %b} to {today:%d %b}"
         lines.append(f"Closed {p.symbol} short ({held}): share {_pounds(share_pnl)}, hedge {_pounds(hedge_pnl)}, "
                      f"{_costs_text(f, p.hedge_expiry)}, net {_pounds(net)} " + ("after costs" if f else "before funding"))
-        book.closed.append({"symbol": p.symbol, "name": p.name, "opened": p.opened, "closed": now.isoformat(),
-                            "report_date": p.report_date, "surprise": p.surprise, "exposure": p.exposure,
+        book.closed.append({**asdict(p), "closed": now.isoformat(), "exit_mid": exit_mid,
+                            "hedge_exit_mid": hedge_exit_mid if hedge_pnl is not None else None,
                             "share_pnl": share_pnl, "hedge_pnl": hedge_pnl, "gross": gross,
                             "funding": f.funding if f else None, "dividends": f.dividends if f else None,
                             "net": net})
@@ -248,6 +263,17 @@ def close_due(book: book_store.Book, client: IGClient, now: pd.Timestamp, lines:
     return total
 
 
+def _quote(client: IGClient, epic: str | None) -> float | None:
+    """IG's mid now, for the record (the IB estimate); None if it can't be had."""
+    if not epic:
+        return None
+    try:
+        return _mid(client.fetch_market(epic))
+    except Exception:  # noqa: BLE001 - a missing quote never stops a close
+        log.warning("no quote for %s", epic, exc_info=True)
+        return None
+
+
 def _pounds(v: float | None) -> str:
     return "n/a" if v is None else f"{'+' if v >= 0 else '-'}£{abs(v):,.2f}"
 
@@ -255,7 +281,8 @@ def _pounds(v: float | None) -> str:
 def plan_entries(today: pd.Timestamp, cfg: Config, held: set[str]) -> tuple[list[signals.Candidate], float | None, int]:
     """Today's candidates: reports whose first session on or after their date was the previous session."""
     prev = sessions.previous_session(today)
-    recent = data.reports(prev - pd.Timedelta(days=6), prev + pd.Timedelta(days=1))
+    week = data.reports(prev - pd.Timedelta(days=6), prev + pd.Timedelta(days=1))
+    recent = week
     if len(recent):
         first = recent.report_date.map(sessions.first_session_on_or_after)
         recent = recent[first == prev]
@@ -263,8 +290,21 @@ def plan_entries(today: pd.Timestamp, cfg: Config, held: set[str]) -> tuple[list
     cut = signals.threshold(history, cfg.quantile)
     if cut is None:
         return [], None, len(recent)
-    found = [c for c in signals.candidates(recent, cut) if c.symbol not in held]
+    earlier = pd.concat([history, week]) if len(week) else history
+    found = [c for c in signals.candidates(recent, cut, signals.revenue_threshold(history, cfg.revenue_quantile),
+                                           earlier, cfg.repeat_within_days)
+             if c.symbol not in held]
     return found, cut, len(recent)
+
+
+def _market_now(client: IGClient, cfg: Config) -> float | None:
+    """The market's price now (IG's SPY quote, in dollars), for each miss's move against it."""
+    try:
+        mid = _mid(client.fetch_market(cfg.market_epic))
+    except Exception:  # noqa: BLE001 - without it a miss can still be backed up by its revenue or last report
+        log.warning("no quote for %s", cfg.market_epic, exc_info=True)
+        return None
+    return mid / 100 if mid else None
 
 
 def open_entries(book: book_store.Book, client: IGClient, cands: list[signals.Candidate], cfg: Config,
@@ -275,6 +315,8 @@ def open_entries(book: book_store.Book, client: IGClient, cands: list[signals.Ca
     hedges = hedge_markets(client, cfg)
     exit_session = sessions.add_sessions(today, cfg.hold_sessions)
     hedge = pick_hedge(hedges, exit_session)
+    market_then = data.closes(cfg.market_symbol, sorted({c.prev_day for c in cands if c.prev_day is not None}))
+    market_now = _market_now(client, cfg)
     opened = 0
     for c in cands:
         if opened >= room:
@@ -292,6 +334,12 @@ def open_entries(book: book_store.Book, client: IGClient, cands: list[signals.Ca
         if status != "TRADEABLE" or mid is None:
             lines.append(f"{c.symbol}: skipped - IG market {status}")
             continue
+        move = signals.reaction(mid / 100, c.prev_close, market_now,
+                                market_then.get(c.prev_day) if c.prev_day is not None else None)
+        backing = signals.confirmations(c, move, cfg.max_reaction)
+        if len(backing) < cfg.min_confirmations:
+            lines.append(f"{c.symbol}: skipped - nothing backs up the miss ({signals.describe(c, move)})")
+            continue
         size = signals.stake(cfg.notional_per_trade, mid, float(market["dealingRules"]["minDealSize"]["value"]),
                              cfg.max_min_stake_ratio)
         if size is None:
@@ -300,7 +348,7 @@ def open_entries(book: book_store.Book, client: IGClient, cands: list[signals.Ca
             continue
         exposure = size * mid
         what = (f"{c.symbol}: surprise {c.surprise * 1e4:+.1f} bp of price (cut {c.threshold * 1e4:+.1f}), "
-                f"short £{size:.2f}/pt ≈ £{exposure:,.0f}")
+                f"backed by {', '.join(backing)}; short £{size:.2f}/pt ≈ £{exposure:,.0f}")
         if dry_run:
             lines.append("WOULD SHORT " + what)
             opened += 1
@@ -315,7 +363,7 @@ def open_entries(book: book_store.Book, client: IGClient, cands: list[signals.Ca
             exposure=round(exposure, 2), opened=now.isoformat(),
             exit_session=f"{exit_session:%Y-%m-%d}",
             report_date=f"{c.report_date:%Y-%m-%d}", surprise=c.surprise, threshold=c.threshold,
-            name=market["instrument"].get("name"))
+            name=market["instrument"].get("name"), entry_mid=mid, confirmations=backing, reaction=move)
         book.positions.append(pos)
         book_store.save(book, path)
         if hedge is None:
@@ -326,7 +374,7 @@ def open_entries(book: book_store.Book, client: IGClient, cands: list[signals.Ca
             h = client.open_market_position(hedge.epic, hedge.expiry, "BUY", hedge_size, "GBP")
             if deal_accepted(h):
                 pos.hedge_deal_id, pos.hedge_size, pos.hedge_level = h["dealId"], hedge_size, _level(h)
-                pos.hedge_epic, pos.hedge_expiry = hedge.epic, hedge.expiry
+                pos.hedge_epic, pos.hedge_expiry, pos.hedge_entry_mid = hedge.epic, hedge.expiry, hedge.mid
             else:
                 lines.append(f"{c.symbol}: hedge REFUSED ({describe_rejection(h)}) - short is unhedged")
                 log.critical("hedge for %s refused: %s", c.symbol, describe_rejection(h))

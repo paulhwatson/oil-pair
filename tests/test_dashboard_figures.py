@@ -152,6 +152,15 @@ def test_open_shorts_are_marked_at_mid_with_their_hedge_and_funding():
     assert row["IG spread now"] == pytest.approx(2722 / 25350)
     assert row["On IG"] == "yes" and row["Closes"] == "Mon 16 Nov"
 
+    # on IB: mid to mid from the entry's mid (the book has none: exposure / size) and the hedge's (its
+    # fill less half IG's spread now), less IB's commissions and borrow fee, plus the hedge's interest
+    from earnings_short import ib
+    assert row["On IB (est.)"] == pytest.approx(ib.estimate(
+        ib.IBCosts(), size=0.24, entry_mid=5844.0 / 0.24, exit_mid=25350, hedge_size=0.76,
+        hedge_entry_mid=7748.36 - 0.5, hedge_exit_mid=7775.23, opened=pd.Timestamp("2026-10-20T19:40:09", tz=UTC),
+        until=pd.Timestamp("2026-10-21T12:00", tz=UTC), dividends=0.0))
+    assert row["On IB (est.)"] == pytest.approx(-220.40, abs=0.01)
+
 
 def test_a_short_missing_from_ig_is_flagged():
     (row,) = figures.open_shorts(short_book(), pd.DataFrame({"dealId": []}), None,
@@ -162,6 +171,7 @@ def test_a_short_missing_from_ig_is_flagged():
 def test_closed_shorts_and_the_last_run(tmp_path):
     (row,) = figures.closed_shorts(short_book()).to_dict("records")
     assert row["Share"] == "BAC" and row["Funding"] == pytest.approx(-1.5) and row["Net"] == pytest.approx(16.5)
+    assert row["On IB (est.)"] is None or pd.isna(row["On IB (est.)"])      # closed before prices were recorded
 
     log = tmp_path / "oil_pair.log"
     log.write_text("2026-10-19 20:40:07,921 INFO earnings_short: 5 report(s) from Fri 16 Oct, 0 miss(es)\n"
@@ -169,3 +179,17 @@ def test_closed_shorts_and_the_last_run(tmp_path):
                    "2026-10-20 20:40:11,324 INFO earnings_short:   Shorted STLD\n")
     at, what = figures.last_short_run(log)
     assert at == pd.Timestamp("2026-10-20T19:40:11", tz=UTC) and what.endswith("opened 1")
+
+
+def test_a_closed_short_recorded_with_its_prices_gets_an_ib_estimate():
+    from earnings_short import ib
+    record = {"symbol": "BAC", "opened": "2026-10-15T19:45:00+00:00", "closed": "2026-11-11T20:45:00+00:00",
+              "size": 0.56, "exposure": 3020.92, "entry_level": 5394.0, "entry_mid": 5394.5, "exit_mid": 5300.0,
+              "hedge_size": 0.39, "hedge_level": 7701.0, "hedge_entry_mid": 7700.0, "hedge_exit_mid": 7750.0,
+              "dividends": -1.5}
+    want = ib.estimate(ib.IBCosts(), size=0.56, entry_mid=5394.5, exit_mid=5300.0, hedge_size=0.39,
+                       hedge_entry_mid=7700.0, hedge_exit_mid=7750.0, dividends=-1.5,
+                       opened=pd.Timestamp("2026-10-15T19:45", tz=UTC), until=pd.Timestamp("2026-11-11T20:45", tz=UTC))
+    assert figures.closed_on_ib(record, ib.IBCosts()) == pytest.approx(want)
+    # 0.56 x 94.5 + 0.39 x 50 = £72.42 mid to mid, +£8.66 the hedge's interest, -£0.67 borrow, -£1.60 commissions
+    assert want == pytest.approx(72.42 + 8.66 - 0.67 - 1.60 - 1.5, abs=0.02)

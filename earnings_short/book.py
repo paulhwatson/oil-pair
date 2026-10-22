@@ -27,6 +27,10 @@ class Position:
     hedge_epic: str | None = None
     hedge_expiry: str | None = None      # DEC-26 for a quarterly contract, DFB for the daily-funded one
     name: str | None = None              # IG's instrument name, as its transaction history gives it
+    entry_mid: float | None = None       # IG's mids when it opened, for the IB estimate (earnings_short/ib.py)
+    hedge_entry_mid: float | None = None
+    confirmations: list | None = None    # what backed up the miss (signals.confirmations)
+    reaction: float | None = None        # its move on the market by the entry (log), if known
 
 
 @dataclass

@@ -85,6 +85,13 @@ def local_figures(pair: str, epics: tuple[str, str]):
     return log, mids, figures.is_running(pair)
 
 
+def ink() -> str:
+    """The colour for lines that should stand out: near-black on a light theme, near-white on a dark one
+    (grey until the browser has said which)."""
+    kind = getattr(getattr(st.context, "theme", None), "type", None)
+    return {"dark": "#f2f2f2", "light": "#111111"}.get(kind, "#8c8c8c")
+
+
 def money(v: float | None) -> str:
     return "" if v is None or pd.isna(v) else f"{'-' if v < 0 else ''}£{abs(v):,.2f}"
 
@@ -183,7 +190,7 @@ def page() -> None:
     for name, curve in curves.items():
         if curve.abs().sum() > 0:
             fig.add_scatter(x=curve.index, y=curve.values, name=name, mode="lines", line_shape="hv")
-    fig.add_scatter(x=total.index, y=total.values, name=TOTAL, mode="lines", line=dict(color="black", width=3))
+    fig.add_scatter(x=total.index, y=total.values, name=TOTAL, mode="lines", line=dict(color=ink(), width=3))
     fig.update_layout(height=420, yaxis_title="£ after costs (open trades at mid)", hovermode="x unified",
                       margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
     st.plotly_chart(fig, width="stretch")
@@ -205,8 +212,8 @@ def page() -> None:
     for level, label, colour in ((s.entry_stds, "entry", "orange"), (s.limit_stds, "take profit", "green"),
                                  (s.stop_stds, "stop", "red")):
         for sign in ((1, -1) if level else (1,)):
-            zf.add_hline(y=sign * level, line=dict(color=colour, dash="dash", width=1),
-                         annotation_text=label if sign > 0 else None, annotation_position="top left")
+            zf.add_hline(y=sign * level, line=dict(color=colour, dash="dash", width=1), annotation_text=label,
+                         annotation_position="top left" if sign > 0 else "bottom left")
     shown_from = spread.index.min() if len(spread) else now
     for t in mine:
         for at, label, symbol in ((t.opened, "opened", "triangle-up"), (t.closed, f"closed {money(t.net)}", "x")):
@@ -217,7 +224,7 @@ def page() -> None:
     if status is not None and len(spread) and status.opened >= spread.index.min():
         near = spread["z"].reindex([status.opened], method="nearest")
         zf.add_scatter(x=[status.opened], y=near.values, mode="markers", showlegend=False,
-                       marker=dict(symbol="triangle-up", size=13, color="black"), hovertext="open now")
+                       marker=dict(symbol="triangle-up", size=13, color=ink()), hovertext="open now")
     zf.update_layout(height=380, yaxis_title="spread, std from zero", margin=dict(l=10, r=10, t=10, b=10),
                      showlegend=False)
     st.plotly_chart(zf, width="stretch")
@@ -227,7 +234,7 @@ def page() -> None:
         st.caption(f"{choice}: running profitability")
         curve = curves[choice]
         pf = go.Figure(go.Scatter(x=curve.index, y=curve.values, mode="lines", line_shape="hv",
-                                  line=dict(color="black")))
+                                  line=dict(color=ink())))
         pf.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="£")
         st.plotly_chart(pf, width="stretch")
     with b:
@@ -279,6 +286,7 @@ def page() -> None:
 def earnings_shorts(positions: pd.DataFrame, transactions, ig_at, now: pd.Timestamp) -> None:
     """The earnings-miss shorts: a separate strategy, kept out of the pairs' figures above."""
     from earnings_short import book as book_store
+    from earnings_short import main as es
 
     st.subheader("Earnings-miss shorts")
     try:
@@ -287,15 +295,20 @@ def earnings_shorts(positions: pd.DataFrame, transactions, ig_at, now: pd.Timest
         st.error(f"Couldn't read the earnings shorts' book ({exc}).")
         return
     run = figures.last_short_run(ROOT / "logs" / "earnings_short" / "oil_pair.log")
-    opened = figures.open_shorts(book, positions, transactions, ig_at or now) if ig_at is not None else pd.DataFrame()
-    closed = figures.closed_shorts(book)
+    ib_costs = es.load_config().ib
+    opened = (figures.open_shorts(book, positions, transactions, ig_at or now, ib_costs)
+              if ig_at is not None else pd.DataFrame())
+    closed = figures.closed_shorts(book, ib_costs)
     open_net = opened["Net"].sum() if len(opened) else 0.0
     banked = closed["Net"].fillna(0).sum() if len(closed) else 0.0
-    c1, c2, c3, c4 = st.columns(4)
+    on_ib = sum(t["On IB (est.)"].fillna(0).sum() for t in (opened, closed) if len(t))
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Open shorts", f"{len(book.positions)}")
     c2.metric("Open P&L at mid", money(open_net) if ig_at is not None else "n/a")
     c3.metric("Banked", money(banked))
     c4.metric("Closed", f"{len(closed)}")
+    c5.metric("Same trades on IB (est.)", money(on_ib), help="Open and closed together, against "
+              f"{money(open_net + banked)} on IG. See the note below.")
     if run:
         st.caption(f"Last run {run[0].tz_convert(UK):%a %d %b %H:%M} UK: {run[1]}.")
     if len(opened):
@@ -304,17 +317,24 @@ def earnings_shorts(positions: pd.DataFrame, transactions, ig_at, now: pd.Timest
             "Now (mid)": st.column_config.NumberColumn(format="%.2f"),
             "IG spread now": st.column_config.NumberColumn(format="percent"),
             **{k: st.column_config.NumberColumn(format="£%.2f")
-               for k in ("Exposure", "Share P&L", "Hedge P&L", "Funding", "Net")},
+               for k in ("Exposure", "Share P&L", "Hedge P&L", "Funding", "Net", "On IB (est.)")},
         })
     elif ig_at is None and book.positions:
         st.write(", ".join(f"{p.symbol} short since {p.opened[:10]}" for p in book.positions))
     if len(closed):
         st.dataframe(closed, hide_index=True, width="stretch", column_config={
-            k: st.column_config.NumberColumn(format="£%.2f") for k in ("Share P&L", "Hedge P&L", "Funding", "Net")})
+            k: st.column_config.NumberColumn(format="£%.2f")
+            for k in ("Share P&L", "Hedge P&L", "Funding", "Net", "On IB (est.)")})
     st.caption("Each short is hedged with a US 500 long of the same exposure and closed 19 sessions on. Open "
                "P&L is at IG's mid prices. Out of US hours IG's share quotes are wide, so closing then would "
                "cost far more than the close at about 15:45 New York will. Funding is IG's nightly short "
                "interest less stock borrowing, shared by exposure, plus any dividend adjustment.")
+    st.caption(f"On IB (est.): the same trade at Interactive Brokers - shares sold at the close, hedged with "
+               f"SPY bought with the proceeds. It runs mid to mid (no bid/offer), less commission on each of "
+               f"the four orders (${ib_costs.commission_per_share}/share, at least £{ib_costs.min_commission:.2f}) "
+               f"and a {ib_costs.borrow_rate:.2%} a year fee to borrow the shares, with no interest either "
+               f"way; the hedge gains the {ib_costs.interest_rate:.1%} a year IG's quarterly US 500 price "
+               "charges. Dividends on the short are paid either way. Rates: config/earnings_short.toml.")
 
 
 page()

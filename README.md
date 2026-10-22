@@ -33,7 +33,10 @@ configured pairs:
 `earnings_short/` is a separate strategy on the same IG account: short S&P 500 shares after their biggest
 earnings misses, each hedged with a US 500 long of the same exposure, held 19 sessions. A report counts
 as a miss when its EPS surprise over the share price before it is in the bottom 20% of the past year's
-S&P 500 reports (Jake's DB: `earnings_sp500`, `us_minute_paths`). It skips shares IG can't short and
+S&P 500 reports (Jake's DB: `earnings_sp500`, `us_minute_paths`), and it is shorted only if something
+backs the miss up: revenue also in the past year's worst 20%, the shares down 3.6% or more on the market
+(SPY) by the entry, or the company's previous report a miss too. In 2016-2026 misses with none of these
+didn't drift at all; with any of them they drifted about twice as much as misses overall. It skips shares IG can't short and
 those whose IG minimum stake (£0.24 a cent) would be over twice the £3,000 notional
 (`config/earnings_short.toml`). launchd runs it each weekday afternoon (`./scripts/install_earnings_short.sh
 install`); it acts once per NYSE session, at about 15:45 New York, and keeps its book in

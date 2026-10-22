@@ -13,7 +13,8 @@ IG, every few minutes (it is one request budget all the pairs share):
 
 The earnings-miss shorts (earnings_short/) come from their book
 (state/earnings_short/book.json), IG's open positions and its transaction
-history for their funding, and their log for the last run.
+history for their funding, and their log for the last run. Beside each is
+an estimate of what it would make at Interactive Brokers (earnings_short/ib.py).
 
 A pair's running profitability is its banked P&L after costs (IG's
 figures, stepping up or down as each trade closes) plus the open trade
@@ -180,9 +181,17 @@ def last_short_run(path: Path) -> tuple[pd.Timestamp, str] | None:
     return pd.Timestamp(found.group(1)).tz_localize(UK).tz_convert("UTC"), found.group(2)
 
 
-def open_shorts(book, positions: pd.DataFrame, transactions: pd.DataFrame | None, now: pd.Timestamp) -> pd.DataFrame:
-    """Each open short with its hedge, marked at IG's mid prices now, and its funding so far."""
+# IG's quarterly US 500 is a point wide: a hedge's mid when it opened, where the book didn't record it
+HEDGE_HALF_SPREAD = 0.5
+
+
+def open_shorts(book, positions: pd.DataFrame, transactions: pd.DataFrame | None, now: pd.Timestamp,
+                ib_costs=None) -> pd.DataFrame:
+    """Each open short with its hedge, marked at IG's mid prices now, its funding so far, and what it
+    would make on IB if closed now."""
+    from earnings_short import ib
     from earnings_short import main as es
+    ib_costs = ib_costs or ib.IBCosts()
 
     by_deal = positions.set_index("dealId") if len(positions) and "dealId" in positions else pd.DataFrame()
     outside = es.outside_holdings(book, positions)
@@ -198,29 +207,55 @@ def open_shorts(book, positions: pd.DataFrame, transactions: pd.DataFrame | None
         hedge_pnl = p.hedge_size * (hedge_mid - p.hedge_level) if hedge_mid is not None and p.hedge_level else None
         f = es.funding(book, p, transactions, outside, now) if transactions is not None else None
         net = (share_pnl or 0.0) + (hedge_pnl or 0.0) + (f.total if f else 0.0)
+        on_ib = None
+        if mid is not None:
+            half = (float(hedge.offer) - float(hedge.bid)) / 2 if hedge is not None else HEDGE_HALF_SPREAD
+            on_ib = ib.estimate(
+                ib_costs, size=p.size, entry_mid=p.entry_mid or p.exposure / p.size, exit_mid=mid,
+                opened=pd.Timestamp(p.opened), until=now, hedge_size=p.hedge_size,
+                hedge_entry_mid=p.hedge_entry_mid or (p.hedge_level - half if p.hedge_level else None),
+                hedge_exit_mid=hedge_mid, dividends=f.dividends if f else 0.0)
         rows.append({
             "Share": p.symbol, "Opened (UK)": pd.Timestamp(p.opened).tz_convert(UK).strftime("%d %b %H:%M"),
             "Report": pd.Timestamp(p.report_date).strftime("%d %b"), "Surprise (bp)": p.surprise * 1e4,
+            "Backed by": "; ".join(p.confirmations) if p.confirmations else "(opened before the rule)",
             "Short": f"£{p.size:.2f}/pt at {p.entry_level / 100:,.2f}" if p.entry_level else f"£{p.size:.2f}/pt",
             "Exposure": p.exposure, "Now (mid)": mid / 100 if mid is not None else None,
             "IG spread now": (float(share.offer) - float(share.bid)) / mid if mid else None,
             "Share P&L": share_pnl,
             "Hedge": f"US 500 {p.hedge_expiry} £{p.hedge_size:.2f}/pt" if p.hedge_deal_id else "UNHEDGED",
-            "Hedge P&L": hedge_pnl, "Funding": f.total if f else None, "Net": net,
+            "Hedge P&L": hedge_pnl, "Funding": f.total if f else None, "Net": net, "On IB (est.)": on_ib,
             "Closes": pd.Timestamp(p.exit_session).strftime("%a %d %b"),
             "On IG": "yes" if share is not None and (hedge is not None or not p.hedge_deal_id) else "MISSING",
         })
     return pd.DataFrame(rows)
 
 
-def closed_shorts(book) -> pd.DataFrame:
-    """The book's closed shorts, newest first, as their close messages reported them."""
+def closed_on_ib(c: dict, ib_costs) -> float | None:
+    """What a closed short (a book.closed record) would have made on IB; None for one closed before the
+    book recorded its prices."""
+    from earnings_short import ib
+    if not (c.get("size") and c.get("exit_mid") and c.get("exposure")):
+        return None
+    hedge_entry = c.get("hedge_entry_mid") or (c["hedge_level"] - HEDGE_HALF_SPREAD if c.get("hedge_level") else None)
+    return ib.estimate(ib_costs, size=c["size"], entry_mid=c.get("entry_mid") or c["exposure"] / c["size"],
+                       exit_mid=c["exit_mid"], opened=pd.Timestamp(c["opened"]), until=pd.Timestamp(c["closed"]),
+                       hedge_size=c.get("hedge_size"), hedge_entry_mid=hedge_entry,
+                       hedge_exit_mid=c.get("hedge_exit_mid"), dividends=c.get("dividends") or 0.0)
+
+
+def closed_shorts(book, ib_costs=None) -> pd.DataFrame:
+    """The book's closed shorts, newest first, as their close messages reported them, and what each
+    would have made on IB."""
+    from earnings_short import ib
+    ib_costs = ib_costs or ib.IBCosts()
     rows = [{
         "Share": c["symbol"], "Opened (UK)": pd.Timestamp(c["opened"]).tz_convert(UK).strftime("%d %b"),
         "Closed (UK)": pd.Timestamp(c["closed"]).tz_convert(UK).strftime("%d %b %H:%M"),
         "Share P&L": c.get("share_pnl"), "Hedge P&L": c.get("hedge_pnl"),
         "Funding": (c.get("funding") or 0.0) + (c.get("dividends") or 0.0) if c.get("funding") is not None else None,
-        "Net": c.get("net"), "Note": "closed outside the app" if c.get("outside_the_app") else "",
+        "Net": c.get("net"), "On IB (est.)": closed_on_ib(c, ib_costs),
+        "Note": "closed outside the app" if c.get("outside_the_app") else "",
         "_at": pd.Timestamp(c["closed"]),
     } for c in book.closed if c.get("closed")]
     if not rows:

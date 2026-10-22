@@ -15,6 +15,16 @@ max_open = 40
 quantile = 0.2
 hold_sessions = 19
 
+# A miss is shorted only if at least `min_confirmations` of these back it up. 2016-2026: misses with none
+# didn't drift (-24 bp a trade against the week's other reports); with one or more, +41 bp (t 2.7).
+min_confirmations = 1
+revenue_quantile = 0.2       # revenue surprise (actual - consensus, over consensus) in the past year's worst 20%
+max_reaction = -0.037        # the shares down at least 3.6% on the market (log -0.037) from the close before
+                             # the report to the entry - IG's quote against SPY's
+repeat_within_days = 150     # the company's previous report, if this recent, a miss on EPS too
+market_symbol = "SPY"        # the market: its close before the report (Jake's DB) and its quote now (IG)
+market_epic = "SI.D.SPY.DAILY.IP"
+
 # The hedge: a US 500 long of the same exposure, opened and closed with each short - on IG's quarterly
 # (futures-style) contract, which has no overnight funding: about 20 bp over a 19-session hold (its price
 # carries interest less dividends) against about 45 bp on the daily-funded one, whose long pays SOFR +
@@ -27,3 +37,11 @@ hedge_fallback_epic = "IX.D.SPTRD.DAILY.IP"
 # just before the 16:00 close.
 window_start = "15:35"
 window_end = "15:58"
+
+# Not used for trading: the dashboard's estimate of what the same shorts would make at Interactive
+# Brokers (earnings_short/ib.py) - shares filled at the close, hedged with SPY bought with the proceeds.
+[ib]
+commission_per_share = 0.005   # $ a share, all-in: IBKR Pro's tiered $0.0035 plus exchange and other fees
+min_commission = 0.40          # £ an order: the $0.35 minimum plus fees
+borrow_rate = 0.003            # a year: IB's fee on easy-to-borrow shares
+interest_rate = 0.039          # a year, about SOFR: what IG's quarterly hedge price charges and SPY doesn't
